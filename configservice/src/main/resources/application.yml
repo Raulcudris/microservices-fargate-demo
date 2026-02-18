@@ -8,8 +8,9 @@ spring:
     config:
       server:
         git:
-          uri: https://github.com/loochon/config-data.git
+          uri: https://github.com/Raulcudris/microservices-fargate-demo.git
           default-label: main
           search-paths: config-data
-          username: ${GIT_NAME}
-          password: ${GIT_TOKEN2}
+          clone-on-start: true
+          #username: ${GIT_NAME}
+          #password: ${GIT_TOKEN2}
