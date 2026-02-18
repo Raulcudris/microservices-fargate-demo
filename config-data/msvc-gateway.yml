@@ -1,0 +1,56 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: msvc-gateway
+
+  cloud:
+    gateway:
+      discovery:
+        locator:
+          enabled: true
+      routes:
+        - id: products-services
+          uri: lb://msvc-products
+          predicates:
+            - Path=/products/**
+          filters:
+            - AuthFilter
+
+        - id: orders-services
+          uri: lb://msvc-orders
+          predicates:
+            - Path=/orders/**
+          filters:
+            - AuthFilter
+
+        - id: payments-services
+          uri: lb://msvc-pay
+          predicates:
+            - Path=/pay/**
+          filters:
+            - AuthFilter
+
+        - id: users-services
+          uri: lb://msvc-users
+          predicates:
+            - Path=/users/**
+          filters:
+            - AuthFilter
+
+eureka:
+  client:
+    fetch-registry: true
+    register-with-eureka: true
+    service-url:
+      defaultZone: http://eureka-service:8761/eureka/
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: always

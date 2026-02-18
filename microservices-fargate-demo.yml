@@ -1,0 +1,790 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Full demo microservices on ECS Fargate with ALB + Cloud Map (Config/Eureka/Gateway/Users/Orders/Products/Pay)"
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: loochon-demo
+
+  VpcCidr:
+    Type: String
+    Default: 10.20.0.0/16
+
+  PublicSubnet1Cidr:
+    Type: String
+    Default: 10.20.1.0/24
+
+  PublicSubnet2Cidr:
+    Type: String
+    Default: 10.20.2.0/24
+
+  NamespaceName:
+    Type: String
+    Default: loochon.local
+
+  DesiredCount:
+    Type: Number
+    Default: 1
+
+  # ---- ECR images (one per service) ----
+  ImageConfig:
+    Type: String
+    Description: "ECR image URI for configservice"
+  ImageEureka:
+    Type: String
+    Description: "ECR image URI for eurekaservice"
+  ImageGateway:
+    Type: String
+    Description: "ECR image URI for gatewayservice"
+  ImageUsers:
+    Type: String
+    Description: "ECR image URI for userservice"
+  ImageOrders:
+    Type: String
+    Description: "ECR image URI for orderservice"
+  ImageProducts:
+    Type: String
+    Description: "ECR image URI for productservice"
+  ImagePay:
+    Type: String
+    Description: "ECR image URI for paymentservice"
+
+  # ---- DB (demo only; for prod use Secrets Manager/SSM) ----
+  DBHost:
+    Type: String
+    Description: "RDS endpoint hostname (no protocol). Example: mydb.xxxxx.us-east-1.rds.amazonaws.com"
+  DBPort:
+    Type: Number
+    Default: 3306
+  DBName:
+    Type: String
+    Default: ecommerce_myshop
+  DBUser:
+    Type: String
+    Default: admin
+  DBPassword:
+    Type: String
+    NoEcho: true
+    Description: "DB password (demo only). For prod use Secrets Manager."
+
+  JwtSecret:
+    Type: String
+    NoEcho: true
+    Description: "JWT secret (demo only). For prod use Secrets Manager."
+
+Resources:
+  # -------------------------
+  # VPC + Public Subnets
+  # -------------------------
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-vpc"
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-igw"
+
+  AttachIgw:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-public-rt"
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachIgw
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Ref PublicSubnet1Cidr
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-public-1"
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Ref PublicSubnet2Cidr
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-public-2"
+
+  AssocPublicSubnet1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  AssocPublicSubnet2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # -------------------------
+  # Security Groups
+  # -------------------------
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP from Internet to ALB
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  ServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow ALB to Gateway and internal service-to-service
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        # ALB -> Gateway (container port 8080)
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+        # Internal ports (allow tasks to talk to each other)
+        - IpProtocol: tcp
+          FromPort: 8081
+          ToPort: 8081
+          SourceSecurityGroupId: !Ref ServiceSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 8761
+          ToPort: 8761
+          SourceSecurityGroupId: !Ref ServiceSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 8001
+          ToPort: 8004
+          SourceSecurityGroupId: !Ref ServiceSecurityGroup
+
+  # -------------------------
+  # Cloud Map (Service Discovery)
+  # -------------------------
+  PrivateNamespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Properties:
+      Name: !Ref NamespaceName
+      Vpc: !Ref VPC
+      Description: !Sub "${ProjectName} private namespace"
+
+  SdServiceConfig:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: config-service
+      NamespaceId: !Ref PrivateNamespace
+      DnsConfig:
+        RoutingPolicy: MULTIVALUE
+        DnsRecords:
+          - Type: A
+            TTL: 10
+      HealthCheckCustomConfig:
+        FailureThreshold: 1
+
+  SdServiceEureka:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: eureka-service
+      NamespaceId: !Ref PrivateNamespace
+      DnsConfig:
+        RoutingPolicy: MULTIVALUE
+        DnsRecords:
+          - Type: A
+            TTL: 10
+      HealthCheckCustomConfig:
+        FailureThreshold: 1
+
+  SdServiceGateway:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: gateway-service
+      NamespaceId: !Ref PrivateNamespace
+      DnsConfig:
+        RoutingPolicy: MULTIVALUE
+        DnsRecords:
+          - Type: A
+            TTL: 10
+      HealthCheckCustomConfig:
+        FailureThreshold: 1
+
+  SdServiceUsers:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: users-service
+      NamespaceId: !Ref PrivateNamespace
+      DnsConfig:
+        RoutingPolicy: MULTIVALUE
+        DnsRecords:
+          - Type: A
+            TTL: 10
+      HealthCheckCustomConfig:
+        FailureThreshold: 1
+
+  SdServiceOrders:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: orders-service
+      NamespaceId: !Ref PrivateNamespace
+      DnsConfig:
+        RoutingPolicy: MULTIVALUE
+        DnsRecords:
+          - Type: A
+            TTL: 10
+      HealthCheckCustomConfig:
+        FailureThreshold: 1
+
+  SdServiceProducts:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: products-service
+      NamespaceId: !Ref PrivateNamespace
+      DnsConfig:
+        RoutingPolicy: MULTIVALUE
+        DnsRecords:
+          - Type: A
+            TTL: 10
+      HealthCheckCustomConfig:
+        FailureThreshold: 1
+
+  SdServicePay:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: pay-service
+      NamespaceId: !Ref PrivateNamespace
+      DnsConfig:
+        RoutingPolicy: MULTIVALUE
+        DnsRecords:
+          - Type: A
+            TTL: 10
+      HealthCheckCustomConfig:
+        FailureThreshold: 1
+
+  # -------------------------
+  # ECS Cluster + Roles
+  # -------------------------
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${ProjectName}-cluster"
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-ecs-exec-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  # -------------------------
+  # CloudWatch Log Groups
+  # -------------------------
+  LogGroupConfig:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${ProjectName}/config"
+      RetentionInDays: 7
+
+  LogGroupEureka:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${ProjectName}/eureka"
+      RetentionInDays: 7
+
+  LogGroupGateway:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${ProjectName}/gateway"
+      RetentionInDays: 7
+
+  LogGroupUsers:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${ProjectName}/users"
+      RetentionInDays: 7
+
+  LogGroupOrders:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${ProjectName}/orders"
+      RetentionInDays: 7
+
+  LogGroupProducts:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${ProjectName}/products"
+      RetentionInDays: 7
+
+  LogGroupPay:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${ProjectName}/pay"
+      RetentionInDays: 7
+
+  # -------------------------
+  # ALB + Target Group + Listener (public -> gateway)
+  # -------------------------
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${ProjectName}-alb"
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+
+  TargetGroupGateway:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${ProjectName}-tg-gw"
+      VpcId: !Ref VPC
+      TargetType: ip
+      Port: 8080
+      Protocol: HTTP
+      HealthCheckPath: /actuator/health
+      HealthCheckProtocol: HTTP
+      Matcher:
+        HttpCode: "200-399"
+
+  ListenerHttp:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroupGateway
+
+  # -------------------------
+  # Task Definitions
+  # -------------------------
+  TaskDefConfig:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${ProjectName}-config"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "256"
+      Memory: "512"
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: configservice
+          Image: !Ref ImageConfig
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8081
+          Environment:
+            - Name: SPRING_APPLICATION_NAME
+              Value: configservice
+            - Name: SERVER_PORT
+              Value: "8081"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroupConfig
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  TaskDefEureka:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${ProjectName}-eureka"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "256"
+      Memory: "512"
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: eurekaservice
+          Image: !Ref ImageEureka
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8761
+          Environment:
+            - Name: SPRING_APPLICATION_NAME
+              Value: msvc-eureka
+            - Name: SERVER_PORT
+              Value: "8761"
+            - Name: SPRING_CLOUD_CONFIG_URI
+              Value: !Sub "http://config-service.${NamespaceName}:8081"
+            - Name: EUREKA_CLIENT_REGISTER_WITH_EUREKA
+              Value: "false"
+            - Name: EUREKA_CLIENT_FETCH_REGISTRY
+              Value: "false"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroupEureka
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  TaskDefGateway:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${ProjectName}-gateway"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "256"
+      Memory: "512"
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: gatewayservice
+          Image: !Ref ImageGateway
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8080
+          Environment:
+            - Name: SPRING_APPLICATION_NAME
+              Value: msvc-gateway
+            - Name: SERVER_PORT
+              Value: "8080"
+            - Name: SPRING_CLOUD_CONFIG_URI
+              Value: !Sub "http://config-service.${NamespaceName}:8081"
+            - Name: EUREKA_CLIENT_SERVICEURL_DEFAULTZONE
+              Value: !Sub "http://eureka-service.${NamespaceName}:8761/eureka"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroupGateway
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  TaskDefUsers:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${ProjectName}-users"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "256"
+      Memory: "512"
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: userservice
+          Image: !Ref ImageUsers
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8004
+          Environment:
+            - Name: SPRING_APPLICATION_NAME
+              Value: msvc-users
+            - Name: SERVER_PORT
+              Value: "8004"
+            - Name: SPRING_CLOUD_CONFIG_URI
+              Value: !Sub "http://config-service.${NamespaceName}:8081"
+            - Name: EUREKA_CLIENT_SERVICEURL_DEFAULTZONE
+              Value: !Sub "http://eureka-service.${NamespaceName}:8761/eureka"
+            - Name: DB_HOST
+              Value: !Ref DBHost
+            - Name: DB_PORT
+              Value: !Ref DBPort
+            - Name: DB_NAME
+              Value: !Ref DBName
+            - Name: DB_USER
+              Value: !Ref DBUser
+            - Name: DB_PASSWORD
+              Value: !Ref DBPassword
+            - Name: JWT_SECRET
+              Value: !Ref JwtSecret
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroupUsers
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  TaskDefOrders:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${ProjectName}-orders"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "256"
+      Memory: "512"
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: orderservice
+          Image: !Ref ImageOrders
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8002
+          Environment:
+            - Name: SPRING_APPLICATION_NAME
+              Value: msvc-orders
+            - Name: SERVER_PORT
+              Value: "8002"
+            - Name: SPRING_CLOUD_CONFIG_URI
+              Value: !Sub "http://config-service.${NamespaceName}:8081"
+            - Name: EUREKA_CLIENT_SERVICEURL_DEFAULTZONE
+              Value: !Sub "http://eureka-service.${NamespaceName}:8761/eureka"
+            - Name: DB_HOST
+              Value: !Ref DBHost
+            - Name: DB_PORT
+              Value: !Ref DBPort
+            - Name: DB_NAME
+              Value: !Ref DBName
+            - Name: DB_USER
+              Value: !Ref DBUser
+            - Name: DB_PASSWORD
+              Value: !Ref DBPassword
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroupOrders
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  TaskDefProducts:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${ProjectName}-products"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "256"
+      Memory: "512"
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: productservice
+          Image: !Ref ImageProducts
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8001
+          Environment:
+            - Name: SPRING_APPLICATION_NAME
+              Value: msvc-products
+            - Name: SERVER_PORT
+              Value: "8001"
+            - Name: SPRING_CLOUD_CONFIG_URI
+              Value: !Sub "http://config-service.${NamespaceName}:8081"
+            - Name: EUREKA_CLIENT_SERVICEURL_DEFAULTZONE
+              Value: !Sub "http://eureka-service.${NamespaceName}:8761/eureka"
+            - Name: DB_HOST
+              Value: !Ref DBHost
+            - Name: DB_PORT
+              Value: !Ref DBPort
+            - Name: DB_NAME
+              Value: !Ref DBName
+            - Name: DB_USER
+              Value: !Ref DBUser
+            - Name: DB_PASSWORD
+              Value: !Ref DBPassword
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroupProducts
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  TaskDefPay:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${ProjectName}-pay"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "256"
+      Memory: "512"
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: paymentservice
+          Image: !Ref ImagePay
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8003
+          Environment:
+            - Name: SPRING_APPLICATION_NAME
+              Value: msvc-pay
+            - Name: SERVER_PORT
+              Value: "8003"
+            - Name: SPRING_CLOUD_CONFIG_URI
+              Value: !Sub "http://config-service.${NamespaceName}:8081"
+            - Name: EUREKA_CLIENT_SERVICEURL_DEFAULTZONE
+              Value: !Sub "http://eureka-service.${NamespaceName}:8761/eureka"
+            - Name: DB_HOST
+              Value: !Ref DBHost
+            - Name: DB_PORT
+              Value: !Ref DBPort
+            - Name: DB_NAME
+              Value: !Ref DBName
+            - Name: DB_USER
+              Value: !Ref DBUser
+            - Name: DB_PASSWORD
+              Value: !Ref DBPassword
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroupPay
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  # -------------------------
+  # ECS Services (deployment order)
+  # -------------------------
+  ServiceConfig:
+    Type: AWS::ECS::Service
+    DependsOn: ListenerHttp
+    Properties:
+      ServiceName: config-service
+      Cluster: !Ref ECSCluster
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredCount
+      TaskDefinition: !Ref TaskDefConfig
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups: [!Ref ServiceSecurityGroup]
+          Subnets: [!Ref PublicSubnet1, !Ref PublicSubnet2]
+      ServiceRegistries:
+        - RegistryArn: !GetAtt SdServiceConfig.Arn
+
+  ServiceEureka:
+    Type: AWS::ECS::Service
+    DependsOn: ServiceConfig
+    Properties:
+      ServiceName: eureka-service
+      Cluster: !Ref ECSCluster
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredCount
+      TaskDefinition: !Ref TaskDefEureka
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups: [!Ref ServiceSecurityGroup]
+          Subnets: [!Ref PublicSubnet1, !Ref PublicSubnet2]
+      ServiceRegistries:
+        - RegistryArn: !GetAtt SdServiceEureka.Arn
+
+  ServiceProducts:
+    Type: AWS::ECS::Service
+    DependsOn: ServiceEureka
+    Properties:
+      ServiceName: products-service
+      Cluster: !Ref ECSCluster
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredCount
+      TaskDefinition: !Ref TaskDefProducts
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups: [!Ref ServiceSecurityGroup]
+          Subnets: [!Ref PublicSubnet1, !Ref PublicSubnet2]
+      ServiceRegistries:
+        - RegistryArn: !GetAtt SdServiceProducts.Arn
+
+  ServiceOrders:
+    Type: AWS::ECS::Service
+    DependsOn: ServiceProducts
+    Properties:
+      ServiceName: orders-service
+      Cluster: !Ref ECSCluster
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredCount
+      TaskDefinition: !Ref TaskDefOrders
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups: [!Ref ServiceSecurityGroup]
+          Subnets: [!Ref PublicSubnet1, !Ref PublicSubnet2]
+      ServiceRegistries:
+        - RegistryArn: !GetAtt SdServiceOrders.Arn
+
+  ServicePay:
+    Type: AWS::ECS::Service
+    DependsOn: ServiceOrders
+    Properties:
+      ServiceName: pay-service
+      Cluster: !Ref ECSCluster
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredCount
+      TaskDefinition: !Ref TaskDefPay
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups: [!Ref ServiceSecurityGroup]
+          Subnets: [!Ref PublicSubnet1, !Ref PublicSubnet2]
+      ServiceRegistries:
+        - RegistryArn: !GetAtt SdServicePay.Arn
+
+  ServiceUsers:
+    Type: AWS::ECS::Service
+    DependsOn: ServicePay
+    Properties:
+      ServiceName: users-service
+      Cluster: !Ref ECSCluster
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredCount
+      TaskDefinition: !Ref TaskDefUsers
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups: [!Ref ServiceSecurityGroup]
+          Subnets: [!Ref PublicSubnet1, !Ref PublicSubnet2]
+      ServiceRegistries:
+        - RegistryArn: !GetAtt SdServiceUsers.Arn
+
+  ServiceGateway:
+    Type: AWS::ECS::Service
+    DependsOn: ServiceUsers
+    Properties:
+      ServiceName: gateway-service
+      Cluster: !Ref ECSCluster
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredCount
+      TaskDefinition: !Ref TaskDefGateway
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups: [!Ref ServiceSecurityGroup]
+          Subnets: [!Ref PublicSubnet1, !Ref PublicSubnet2]
+      LoadBalancers:
+        - ContainerName: gatewayservice
+          ContainerPort: 8080
+          TargetGroupArn: !Ref TargetGroupGateway
+      ServiceRegistries:
+        - RegistryArn: !GetAtt SdServiceGateway.Arn
+
+Outputs:
+  AlbDnsName:
+    Description: "Public URL (ALB DNS)"
+    Value: !GetAtt ALB.DNSName
+
+  ServiceDiscoveryNamespace:
+    Description: "Private DNS namespace for ECS service discovery"
+    Value: !Ref NamespaceName

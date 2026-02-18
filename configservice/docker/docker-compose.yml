@@ -1,0 +1,18 @@
+version: '3.8'
+services:
+  srv_system_config:
+    build:
+      context: ../  # Contexto del build, cambia a la carpeta system_config
+      dockerfile: docker/Dockerfile
+    container_name: msvc_system_config
+    ports:
+      - "8081:8081"
+    restart: always
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: 0.5
+        reservations:
+          memory: 512M
+          cpus: 0.5

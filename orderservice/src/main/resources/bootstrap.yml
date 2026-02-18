@@ -1,0 +1,7 @@
+spring:
+  application:
+    name: msvc-orders
+  cloud:
+    config:
+      enabled: true
+      uri: http://configservice:8081

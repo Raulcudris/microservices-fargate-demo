@@ -1,0 +1,7 @@
+spring:
+  application:
+    name: msvc-pay
+  cloud:
+    config:
+      enabled: true
+      uri: http://localhost:8081
