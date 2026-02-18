@@ -1,190 +1,129 @@
-version: "3.8"
-
+version: '3.8'
 services:
-
-  config-service:
-    build:
-      context: ./configservice
-      dockerfile: docker/Dockerfile
-    container_name: config-service
-    env_file:
-      - .env
-    environment:
-      SPRING_APPLICATION_NAME: configservice
-      SPRING_PROFILES_ACTIVE: native
-      SPRING_CLOUD_CONFIG_SERVER_NATIVE_SEARCH_LOCATIONS: file:/config-data
-      JAVA_TOOL_OPTIONS: ${JAVA_TOOL_OPTIONS_SMALL}
-    volumes:
-      - ./config-data:/config-data:ro
-    restart: unless-stopped
-    mem_limit: 384m
-    cpus: "0.35"
-    networks:
-      - backend-net
-
-  eureka-service:
-    build:
-      context: ./eurekaservice
-      dockerfile: docker/Dockerfile
-    container_name: eureka-service
-    env_file:
-      - .env
-    depends_on:
-      - config-service
-    environment:
-      SPRING_APPLICATION_NAME: msvc-eureka
-      SPRING_PROFILES_ACTIVE: ${SPRING_PROFILES_ACTIVE}
-      SPRING_CLOUD_CONFIG_URI: ${SPRING_CLOUD_CONFIG_URI}
-      SPRING_CLOUD_CONFIG_FAILFAST: "false"
-      JAVA_TOOL_OPTIONS: ${JAVA_TOOL_OPTIONS_SMALL}
-    restart: unless-stopped
-    mem_limit: 384m
-    cpus: "0.35"
-    networks:
-      - backend-net
-
-  gateway-service:
-    build:
-      context: ./gatewayservice
-      dockerfile: docker/Dockerfile
-    container_name: gateway-service
-    env_file:
-      - .env
+  configservice:
+    build: ./configservice
+    container_name: configservice
     ports:
-      - "80:8080"
-    depends_on:
-      - eureka-service
-      - config-service
-    environment:
-      SPRING_APPLICATION_NAME: msvc-gateway
-      SPRING_PROFILES_ACTIVE: ${SPRING_PROFILES_ACTIVE}
-      SPRING_CLOUD_CONFIG_URI: ${SPRING_CLOUD_CONFIG_URI}
-      SPRING_CLOUD_CONFIG_FAILFAST: "false"
-      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: ${EUREKA_CLIENT_SERVICEURL_DEFAULTZONE}
-      JWT_SECRET: ${JWT_SECRET}
-      JAVA_TOOL_OPTIONS: ${JAVA_TOOL_OPTIONS_GATEWAY}
-    restart: unless-stopped
-    mem_limit: 512m
-    cpus: "0.40"
-    networks:
-      - backend-net
+      - "8081:8081"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
 
-  users-service:
-    build:
-      context: ./userservice
-      dockerfile: docker/Dockerfile
-    container_name: users-service
-    env_file:
-      - .env
-    depends_on:
-      - eureka-service
-      - config-service
+  eurekaservice:
+    build: ./eurekaservice
+    container_name: eurekaservice
+    ports:
+      - "8761:8761"
     environment:
-      SPRING_APPLICATION_NAME: msvc-users
-      SPRING_PROFILES_ACTIVE: ${SPRING_PROFILES_ACTIVE}
-      SPRING_CLOUD_CONFIG_URI: ${SPRING_CLOUD_CONFIG_URI}
-      SPRING_CLOUD_CONFIG_FAILFAST: "false"
-      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: ${EUREKA_CLIENT_SERVICEURL_DEFAULTZONE}
-      JWT_SECRET: ${JWT_SECRET}
-      SPRING_DATASOURCE_URL: ${SPRING_DATASOURCE_URL}
-      SPRING_DATASOURCE_USERNAME: ${SPRING_DATASOURCE_USERNAME}
-      SPRING_DATASOURCE_PASSWORD: ${SPRING_DATASOURCE_PASSWORD}
-      JAVA_TOOL_OPTIONS: ${JAVA_TOOL_OPTIONS_SMALL}
-    volumes:
-      - /home/ubuntu/certs:/certs:ro
-    restart: unless-stopped
-    mem_limit: 384m
-    cpus: "0.35"
-    networks:
-      - backend-net
-
-  products-service:
-    build:
-      context: ./productservice
-      dockerfile: docker/Dockerfile
-    container_name: products-service
-    env_file:
-      - .env
+      - CONFIG_SERVICE_URL=http://configservice:8081
     depends_on:
-      - eureka-service
-      - config-service
-    environment:
-      SPRING_APPLICATION_NAME: msvc-products
-      SPRING_PROFILES_ACTIVE: ${SPRING_PROFILES_ACTIVE}
-      SPRING_CLOUD_CONFIG_URI: ${SPRING_CLOUD_CONFIG_URI}
-      SPRING_CLOUD_CONFIG_FAILFAST: "false"
-      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: ${EUREKA_CLIENT_SERVICEURL_DEFAULTZONE}
-      JWT_SECRET: ${JWT_SECRET}
-      SPRING_DATASOURCE_URL: ${SPRING_DATASOURCE_URL}
-      SPRING_DATASOURCE_USERNAME: ${SPRING_DATASOURCE_USERNAME}
-      SPRING_DATASOURCE_PASSWORD: ${SPRING_DATASOURCE_PASSWORD}
-      JAVA_TOOL_OPTIONS: ${JAVA_TOOL_OPTIONS_SMALL}
-    volumes:
-      - /home/ubuntu/certs:/certs:ro
-    restart: unless-stopped
-    mem_limit: 384m
-    cpus: "0.35"
-    networks:
-      - backend-net
+      - configservice
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8761/actuator/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
 
-  orders-service:
-    build:
-      context: ./orderservice
-      dockerfile: docker/Dockerfile
-    container_name: orders-service
-    env_file:
-      - .env
+  gatewayservice:
+    build: ./gatewayservice
+    container_name: gatewayservice
+    ports:
+      - "8080:8080"
+    environment:
+      - EUREKA_URL=http://eurekaservice:8761
+      - CONFIG_SERVICE_URL=http://configservice:8081
     depends_on:
-      - eureka-service
-      - config-service
-    environment:
-      SPRING_APPLICATION_NAME: msvc-orders
-      SPRING_PROFILES_ACTIVE: ${SPRING_PROFILES_ACTIVE}
-      SPRING_CLOUD_CONFIG_URI: ${SPRING_CLOUD_CONFIG_URI}
-      SPRING_CLOUD_CONFIG_FAILFAST: "false"
-      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: ${EUREKA_CLIENT_SERVICEURL_DEFAULTZONE}
-      JWT_SECRET: ${JWT_SECRET}
-      SPRING_DATASOURCE_URL: ${SPRING_DATASOURCE_URL}
-      SPRING_DATASOURCE_USERNAME: ${SPRING_DATASOURCE_USERNAME}
-      SPRING_DATASOURCE_PASSWORD: ${SPRING_DATASOURCE_PASSWORD}
-      JAVA_TOOL_OPTIONS: ${JAVA_TOOL_OPTIONS_SMALL}
-    volumes:
-      - /home/ubuntu/certs:/certs:ro
-    restart: unless-stopped
-    mem_limit: 384m
-    cpus: "0.35"
-    networks:
-      - backend-net
+      - eurekaservice
+      - configservice
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s 
 
-  payment-service:
-    build:
-      context: ./paymentservice
-      dockerfile: docker/Dockerfile
-    container_name: payment-service
-    env_file:
-      - .env
+  orderservice:
+    build: ./orderservice
+    container_name: orderservice
+    ports:
+      - "8002:8002"
+    environment:
+      - EUREKA_URL=http://eurekaservice:8761
+      - CONFIG_SERVICE_URL=http://configservice:8081
+      - GATEWAY_URL=http://gatewayservice:8080
     depends_on:
-      - eureka-service
-      - config-service
-    environment:
-      SPRING_APPLICATION_NAME: msvc-pay
-      SPRING_PROFILES_ACTIVE: ${SPRING_PROFILES_ACTIVE}
-      SPRING_CLOUD_CONFIG_URI: ${SPRING_CLOUD_CONFIG_URI}
-      SPRING_CLOUD_CONFIG_FAILFAST: "false"
-      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: ${EUREKA_CLIENT_SERVICEURL_DEFAULTZONE}
-      JWT_SECRET: ${JWT_SECRET}
-      SPRING_DATASOURCE_URL: ${SPRING_DATASOURCE_URL}
-      SPRING_DATASOURCE_USERNAME: ${SPRING_DATASOURCE_USERNAME}
-      SPRING_DATASOURCE_PASSWORD: ${SPRING_DATASOURCE_PASSWORD}
-      JAVA_TOOL_OPTIONS: ${JAVA_TOOL_OPTIONS_SMALL}
-    volumes:
-      - /home/ubuntu/certs:/certs:ro
-    restart: unless-stopped
-    mem_limit: 384m
-    cpus: "0.35"
-    networks:
-      - backend-net
+      - gatewayservice
+      - eurekaservice
+      - configservice
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s  
 
-networks:
-  backend-net:
-    driver: bridge
+  paymentservice:
+    build: ./paymentservice
+    container_name: paymentservice
+    ports:
+      - "8003:8003"
+    environment:
+      - EUREKA_URL=http://eurekaservice:8761
+      - CONFIG_SERVICE_URL=http://configservice:8081
+      - GATEWAY_URL=http://gatewayservice:8080
+    depends_on:
+      - gatewayservice
+      - eurekaservice
+      - configservice
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s  
+
+  productservice:
+    build: ./productservice
+    container_name: productservice
+    ports:
+      - "8001:8001"
+    environment:
+      - EUREKA_URL=http://eurekaservice:8761
+      - CONFIG_SERVICE_URL=http://configservice:8081
+      - GATEWAY_URL=http://gatewayservice:8080
+    depends_on:
+      - gatewayservice
+      - eurekaservice
+      - configservice
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s  
+
+
+  userservice:
+    build: ./userservice
+    container_name: userservice
+    ports:
+      - "8004:8004"
+    environment:
+      - EUREKA_URL=http://eurekaservice:8761
+      - CONFIG_SERVICE_URL=http://configservice:8081
+      - GATEWAY_URL=http://gatewayservice:8080
+    depends_on:
+      - gatewayservice
+      - eurekaservice
+      - configservice
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8004/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s  
+
