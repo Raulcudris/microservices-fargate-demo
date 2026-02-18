@@ -7,7 +7,7 @@ spring:
 
   datasource:
     #url: jdbc:mysql://${DB_HOST}:${DB_PORT}/${DB_NAME}?useSSL=true&serverTimezone=UTC&allowPublicKeyRetrieval=true
-    jdbc-url: jdbc:mysql://localhost:3306/dbmysqljobs
+    url: jdbc:mysql://localhost:3306/dbmysqljobs
     username: root
     password: root
     driver-class-name: com.mysql.cj.jdbc.Driver
