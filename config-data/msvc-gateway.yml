@@ -36,8 +36,6 @@ spring:
           uri: lb://msvc-users
           predicates:
             - Path=/users/**
-          filters:
-            - AuthFilter
 
 eureka:
   client:
