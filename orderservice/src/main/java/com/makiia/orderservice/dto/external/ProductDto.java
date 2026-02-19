@@ -1,5 +1,4 @@
 package com.makiia.orderservice.dto.external;
-
 import lombok.Data;
 import java.math.BigDecimal;
 

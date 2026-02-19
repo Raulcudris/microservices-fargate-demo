@@ -1,5 +1,5 @@
 package com.makiia.productservice.controller;
-
+import com.makiia.productservice.dto.HealthResponse;
 import com.makiia.productservice.dto.NewProductDto;
 import com.makiia.productservice.dto.ProductsDto;
 import com.makiia.productservice.service.ProductsService;
@@ -7,6 +7,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
+import java.time.LocalDateTime;
 import java.util.List;
 
 @RestController
@@ -19,6 +20,23 @@ public class ProductController {
         this.productsService = productsService;
     }
 
+    // =============================
+    // HEALTH ENDPOINT
+    // =============================
+    @GetMapping("/health")
+    public ResponseEntity<HealthResponse> health() {
+        HealthResponse response = new HealthResponse(
+                "UP",
+                "Product Service",
+                LocalDateTime.now().toString()
+        );
+
+        return ResponseEntity.ok(response);
+    }
+
+    // =============================
+    // PRODUCTS
+    // =============================
     @GetMapping
     public ResponseEntity<List<ProductsDto>> getAll() {
         return ResponseEntity.ok(productsService.getAll());

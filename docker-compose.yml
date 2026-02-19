@@ -6,7 +6,7 @@ services:
     ports:
       - "8081:8081"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8081/api/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -40,7 +40,7 @@ services:
       - eurekaservice
       - configservice
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/api/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -60,7 +60,7 @@ services:
       - eurekaservice
       - configservice
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8002/api/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8002/orders/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -80,7 +80,7 @@ services:
       - eurekaservice
       - configservice
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8003/api/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8003/payments/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -100,7 +100,7 @@ services:
       - eurekaservice
       - configservice
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8001/api/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8001/products/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -121,7 +121,7 @@ services:
       - eurekaservice
       - configservice
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8004/api/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8004/users/health"]
       interval: 30s
       timeout: 10s
       retries: 3

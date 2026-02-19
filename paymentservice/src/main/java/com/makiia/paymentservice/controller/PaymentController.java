@@ -1,11 +1,13 @@
 package com.makiia.paymentservice.controller;
 
+import com.makiia.paymentservice.dto.HealthResponse;
 import com.makiia.paymentservice.dto.PaymentRequestDto;
 import com.makiia.paymentservice.dto.PaymentResponseDto;
 import com.makiia.paymentservice.service.PaymentService;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
+import java.time.LocalDateTime;
 import java.util.List;
 
 @RestController
@@ -16,6 +18,20 @@ public class PaymentController {
 
     public PaymentController(PaymentService paymentService) {
         this.paymentService = paymentService;
+    }
+
+    // =============================
+    // HEALTH ENDPOINT
+    // =============================
+    @GetMapping("/health")
+    public ResponseEntity<HealthResponse> health() {
+        HealthResponse response = new HealthResponse(
+                "UP",
+                "Payments Service",
+                LocalDateTime.now().toString()
+        );
+
+        return ResponseEntity.ok(response);
     }
 
     // 💳 PROCESAR PAGO

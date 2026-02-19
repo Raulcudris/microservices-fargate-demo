@@ -1,20 +1,33 @@
 package com.makiia.userservice.controller;
-
-import com.makiia.userservice.dto.EntityUsersDto;
-import com.makiia.userservice.dto.NewUserDto;
-import com.makiia.userservice.dto.RequestDto;
-import com.makiia.userservice.dto.TokenDto;
+import com.makiia.userservice.dto.*;
 import com.makiia.userservice.entity.EntityUsers;
 import com.makiia.userservice.service.EntityUsersService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
+import java.time.LocalDateTime;
+
 @RestController
 @RequestMapping("/users")
 public class EntityUsersController {
     @Autowired
     EntityUsersService entityUsersService;
+
+    // =============================
+    // HEALTH ENDPOINT
+    // =============================
+    @GetMapping("/health")
+    public ResponseEntity<HealthResponse> health() {
+        HealthResponse response = new HealthResponse(
+                "UP",
+                "Users Service",
+                LocalDateTime.now().toString()
+        );
+
+        return ResponseEntity.ok(response);
+    }
+
 
     @PostMapping("/login")
     public ResponseEntity<TokenDto> login(@RequestBody EntityUsersDto dto){
