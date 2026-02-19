@@ -6,9 +6,9 @@ spring:
     name: msvc-users
 
   datasource:
-    url: jdbc:mysql://${DB_HOST:localhost}:${DB_PORT:3306}/${DB_NAME:app}?useSSL=true&serverTimezone=UTC
-    username: ${DB_USER:admin}
-    password: ${DB_PASSWORD:${DB_PASS:R00t2024**}}
+    url: jdbc:mysql://${DB_HOST}:${DB_PORT:3306}/${DB_NAME}?useSSL=true&serverTimezone=UTC
+    username: ${DB_USER}
+    password: ${DB_PASSWORD}
     driver-class-name: com.mysql.cj.jdbc.Driver
     hikari:
       initializationFailTimeout: 0
@@ -30,7 +30,7 @@ eureka:
       defaultZone: ${EUREKA_URL:http://eurekaservice:8761}/eureka
 
 jwt:
-  secret: ${JWT_SECRET:eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiYWRtaW4iOnRydWUsImlhdCI6MTUxNjIzOTAyMn0.KMUFsIDTnFmyG3nMiGM6H9FNFUROf3wh7SmqJp-QV30}
+  secret: ${JWT_SECRET}
 
 management:
   endpoints:

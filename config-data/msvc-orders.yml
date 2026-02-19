@@ -6,12 +6,12 @@ spring:
     name: msvc-orders
 
   datasource:
-    url: jdbc:mysql://${DB_HOST:localhost}:${DB_PORT:3306}/${DB_NAME:app}?useSSL=true&serverTimezone=UTC
-    username: ${DB_USER:root}
-    password: ${DB_PASSWORD:${DB_PASS:root}}
+    url: jdbc:mysql://${DB_HOST}:${DB_PORT:3306}/${DB_NAME}?useSSL=true&serverTimezone=UTC
+    username: ${DB_USER}
+    password: ${DB_PASSWORD}
     driver-class-name: com.mysql.cj.jdbc.Driver
     hikari:
-      initializationFailTimeout: 0   # no muere si DB no está lista aún
+      initializationFailTimeout: 0
       connectionTimeout: 30000
       maximumPoolSize: 10
 
