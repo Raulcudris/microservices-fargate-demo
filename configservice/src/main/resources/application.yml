@@ -4,6 +4,7 @@ server:
 spring:
   application:
     name: configservice
+
   cloud:
     config:
       server:
@@ -12,5 +13,15 @@ spring:
           default-label: main
           search-paths: config-data
           clone-on-start: true
-          #username: ${GIT_NAME}
-          #password: ${GIT_TOKEN2}
+          # Si el repo llega a ser privado, usa env vars / Secrets:
+          #username: ${GIT_NAME:}
+          #password: ${GIT_TOKEN:}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: always

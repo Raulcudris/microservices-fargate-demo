@@ -6,13 +6,12 @@ spring:
     name: msvc-pay
 
   datasource:
-    url: jdbc:mysql://localhost:3306/ecommerce_myshop
-    username: root
-    password: root
+    url: jdbc:mysql://${DB_HOST:localhost}:3306/${DB_NAME:app}?useSSL=true&serverTimezone=UTC
+    username: ${DB_USER:root}
+    password: ${DB_PASS:root}
     driver-class-name: com.mysql.cj.jdbc.Driver
     hikari:
       initializationFailTimeout: 0
-
 
   jpa:
     hibernate:
@@ -26,7 +25,7 @@ eureka:
     fetch-registry: true
     register-with-eureka: true
     service-url:
-      defaultZone: http://localhost:8761/eureka
+      defaultZone: http://eurekaservice:8761/eureka/
 
 management:
   endpoints:
