@@ -1,18 +1,30 @@
 # ---- Build Stage ----
-FROM maven:3.9.6-eclipse-temurin-11 AS build
+FROM eclipse-temurin:11-jdk-jammy AS build
 WORKDIR /app
-COPY pom.xml .
+
+# Copia archivos de Gradle (para cache)
+COPY gradlew .
+COPY gradle ./gradle
+COPY build.gradle* settings.gradle* gradle.properties* ./
+
+# Permisos para ejecutar wrapper
+RUN chmod +x gradlew
+
+# Copia el código
 COPY src ./src
-RUN mvn clean package -DskipTests
+
+# Compila (Spring Boot)
+RUN ./gradlew --no-daemon clean bootJar -x test
 
 # ---- Run Stage ----
 FROM eclipse-temurin:11-jre-jammy
 WORKDIR /app
 
-# curl para healthcheck del docker-compose
-RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+# El jar de Gradle normalmente queda aquí
+COPY --from=build /app/build/libs/*.jar app.jar
 
-COPY --from=build /app/target/*.jar app.jar
+# ✅ Recomendado para Fargate
+ENV JAVA_TOOL_OPTIONS="-XX:MaxRAMPercentage=75.0 -XX:InitialRAMPercentage=25.0 -Djava.security.egd=file:/dev/./urandom"
 
 EXPOSE 8080
-ENTRYPOINT ["java", "-jar", "/app/app.jar"]
+ENTRYPOINT ["sh","-c","java $JAVA_TOOL_OPTIONS -jar /app/app.jar"]

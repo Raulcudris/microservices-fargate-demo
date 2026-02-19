@@ -1,18 +1,26 @@
 # ---- Build Stage ----
-FROM maven:3.9.6-eclipse-temurin-11 AS build
+FROM eclipse-temurin:11-jdk-jammy AS build
 WORKDIR /app
-COPY pom.xml .
+
+# Cache de dependencias
+COPY gradlew .
+COPY gradle ./gradle
+COPY build.gradle* settings.gradle* gradle.properties* ./
+RUN chmod +x gradlew
+
+# Código
 COPY src ./src
-RUN mvn clean package -DskipTests
+
+# Build jar
+RUN ./gradlew --no-daemon clean bootJar -x test
 
 # ---- Run Stage ----
 FROM eclipse-temurin:11-jre-jammy
 WORKDIR /app
 
-# curl para healthcheck del docker-compose
-RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+COPY --from=build /app/build/libs/*.jar app.jar
 
-COPY --from=build /app/target/*.jar app.jar
+ENV JAVA_TOOL_OPTIONS="-XX:MaxRAMPercentage=75.0 -XX:InitialRAMPercentage=25.0 -Djava.security.egd=file:/dev/./urandom"
 
 EXPOSE 8002
-ENTRYPOINT ["java", "-jar", "/app/app.jar"]
+ENTRYPOINT ["sh","-c","java $JAVA_TOOL_OPTIONS -jar /app/app.jar"]
