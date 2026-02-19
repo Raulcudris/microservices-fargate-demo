@@ -1,7 +1,14 @@
 spring:
   application:
     name: msvc-products
+    
   cloud:
     config:
       enabled: true
-      uri: http://localhost:8081
+      uri: ${CONFIG_SERVICE_URL:http://configservice:8081}
+      fail-fast: true
+      retry:
+        max-attempts: 30
+        initial-interval: 2000
+        multiplier: 1.5
+        max-interval: 15000

@@ -6,9 +6,15 @@ spring:
     name: msvc-orders
 
   datasource:
-    url: jdbc:mysql://${DB_HOST:localhost}:3306/${DB_NAME:app}?useSSL=true&serverTimezone=UTC
+    url: jdbc:mysql://${DB_HOST:localhost}:${DB_PORT:3306}/${DB_NAME:app}?useSSL=true&serverTimezone=UTC
     username: ${DB_USER:root}
-    password: ${DB_PASS:root}
+    password: ${DB_PASSWORD:${DB_PASS:root}}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      initializationFailTimeout: 0   # no muere si DB no está lista aún
+      connectionTimeout: 30000
+      maximumPoolSize: 10
+
   jpa:
     hibernate:
       ddl-auto: update
@@ -16,26 +22,12 @@ spring:
       hibernate:
         dialect: org.hibernate.dialect.MySQL8Dialect
 
-  # datasource:
-  #   url: jdbc:mysql://localhost:3306/ecommerce_myshop
-  #   username: root
-  #   password: root
-  #   driver-class-name: com.mysql.cj.jdbc.Driver
-  #   hikari:
-  #     initializationFailTimeout: 0
-  # jpa:
-  #   hibernate:
-  #     ddl-auto: update
-  #   properties:
-  #     hibernate:
-  #       dialect: org.hibernate.dialect.MySQL8Dialect
-
 eureka:
   client:
     fetch-registry: true
     register-with-eureka: true
     service-url:
-      defaultZone: http://eurekaservice:8761/eureka/
+      defaultZone: ${EUREKA_URL:http://eurekaservice:8761}/eureka
 
 management:
   endpoints:

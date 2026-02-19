@@ -6,11 +6,12 @@ set -euo pipefail
 # - Reusa recursos existentes por TAG/NAME
 # - Guarda estado local (checkpoint) y continúa donde quedó
 # - VPC (public+private) + VPC Endpoints (ECR/Logs/S3) para NO NAT
+# - SOLO configservice sale a Internet (GitHub clone) usando subnet pública + Public IP
 # - ECR + build/push
 # - IAM ExecutionRole (solo AmazonECSTaskExecutionRolePolicy)
 # - CloudWatch Logs
 # - ECS Cluster + Cloud Map (Namespace + Services)
-# - (Opcional) RDS MySQL (privado) con password HARDCODED
+# - (Opcional) RDS MySQL (privado)
 # - ALB (solo Gateway)
 # - ECS Services (create-or-update + force-new-deployment)
 # ============================================================
@@ -63,7 +64,7 @@ PORT_PAY=8003
 PORT_USERS=8004
 
 # ALB health check (Gateway) — asegúrate que NO requiera auth
-HEALTH_PATH_GATEWAY="/actuator/health"
+HEALTH_PATH_GATEWAY="/health"
 
 # Cloud Map
 NAMESPACE_NAME="${PROJECT}.local"
@@ -85,7 +86,7 @@ MEM_MED="1024"
 CREATE_RDS="true"         # true/false
 DB_NAME="ecommerce_myshop"
 DB_USER="admin"
-DB_PASS="R00t2024**"      # ⚠️ HARDCODED (como pediste)
+DB_PASS="R00t2024**"      # ⚠️ HARDCODED (recomendado mover a Secrets Manager)
 DB_INSTANCE_ID="${PROJECT}-mysql"
 DB_INSTANCE_CLASS="db.t3.micro"
 DB_ALLOCATED_STORAGE="20"
@@ -116,10 +117,12 @@ state_init() {
     echo '{}' > "$STATE_FILE"
   fi
 }
+
 state_get() {
   local key="$1"
-  jq -r --arg k "$key" '.[$k] // empty' "$STATE_FILE"
+  jq -r --arg k "$key" '.[$k] // empty' "$STATE_FILE" 2>/dev/null || true
 }
+
 state_set() {
   local key="$1"; local val="$2"
   local tmp
@@ -127,6 +130,7 @@ state_set() {
   jq --arg k "$key" --arg v "$val" '.[$k]=$v' "$STATE_FILE" > "$tmp"
   mv "$tmp" "$STATE_FILE"
 }
+
 step_done() { state_set "step_${1}" "done"; }
 is_step_done() { [[ "$(state_get "step_${1}")" == "done" ]]; }
 
@@ -209,15 +213,14 @@ tag_push() {
   docker push "$ECR/$repo:latest"
 }
 
+# Merge de arrays JSON sin /tmp ni /dev/fd (Git Bash safe)
 merge_env() {
   local a="${1:-[]}"
   local b="${2:-[]}"
 
-  # Si llegan vacíos, fuerza a array vacío
   [[ -z "${a//[[:space:]]/}" ]] && a="[]"
   [[ -z "${b//[[:space:]]/}" ]] && b="[]"
 
-  # Merge de arrays JSON sin /tmp ni /dev/fd
   jq -cn --argjson A "$a" --argjson B "$b" '$A + $B'
 }
 
@@ -383,7 +386,17 @@ state_init
 log "0) Identidad AWS..."
 ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 ECR="${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com"
-TAG="$(date +%Y%m%d-%H%M%S)"
+
+# -------------------------
+# TAG estable para modo resumible
+# -------------------------
+STATE_TAG="$(state_get TAG)"
+if [[ -n "${STATE_TAG:-}" && "${STATE_TAG}" != "null" ]]; then
+  TAG="$STATE_TAG"
+else
+  TAG="$(date +%Y%m%d-%H%M%S)"
+  state_set TAG "$TAG"
+fi
 
 ok "Account: $ACCOUNT_ID"
 ok "Region : $REGION"
@@ -502,7 +515,7 @@ if ! is_step_done 2; then
 
   SG_ALB_ID="$(ensure_sg "${PROJECT}-sg-alb" "ALB SG" "SG_ALB_ID")"
   SG_ECS_PRIVATE_ID="$(ensure_sg "${PROJECT}-sg-ecs-private" "ECS Tasks Private SG" "SG_ECS_PRIVATE_ID")"
-  SG_CONFIG_ID="$(ensure_sg "${PROJECT}-sg-config-egress" "ConfigService SG (public subnet but private ingress)" "SG_CONFIG_ID")"
+  SG_CONFIG_ID="$(ensure_sg "${PROJECT}-sg-config-egress" "ConfigService SG (public subnet w/ public IP)" "SG_CONFIG_ID")"
   SG_RDS_ID="$(ensure_sg "${PROJECT}-sg-rds" "RDS MySQL SG" "SG_RDS_ID")"
   SG_VPCE_ID="$(ensure_sg "${PROJECT}-sg-vpce" "VPC Endpoints SG" "SG_VPCE_ID")"
 
@@ -510,35 +523,26 @@ if ! is_step_done 2; then
   awsq ec2 authorize-security-group-ingress --group-id "$SG_ALB_ID" \
     --ip-permissions '[{"IpProtocol":"tcp","FromPort":80,"ToPort":80,"IpRanges":[{"CidrIp":"0.0.0.0/0"}]}]' >/dev/null 2>&1 || true
 
-  # Gateway 8080 desde ALB
+  # Gateway 8080 desde ALB -> ECS privado
   awsq ec2 authorize-security-group-ingress --group-id "$SG_ECS_PRIVATE_ID" \
     --ip-permissions "[{\"IpProtocol\":\"tcp\",\"FromPort\":${PORT_GATEWAY},\"ToPort\":${PORT_GATEWAY},\"UserIdGroupPairs\":[{\"GroupId\":\"${SG_ALB_ID}\"}]}]" >/dev/null 2>&1 || true
 
-  # Config 8081 desde ECS privado
+  # Config 8081 desde ECS privado -> Config en público
   awsq ec2 authorize-security-group-ingress --group-id "$SG_CONFIG_ID" \
     --ip-permissions "[{\"IpProtocol\":\"tcp\",\"FromPort\":${PORT_CONFIG},\"ToPort\":${PORT_CONFIG},\"UserIdGroupPairs\":[{\"GroupId\":\"${SG_ECS_PRIVATE_ID}\"}]}]" >/dev/null 2>&1 || true
 
-  # RDS 3306 desde ECS privado
+  # ✅ SOLO ConfigService sale a Internet (GitHub clone) — 80/443
+  awsq ec2 authorize-security-group-egress --group-id "$SG_CONFIG_ID" \
+    --ip-permissions '[{"IpProtocol":"tcp","FromPort":443,"ToPort":443,"IpRanges":[{"CidrIp":"0.0.0.0/0"}]},
+                      {"IpProtocol":"tcp","FromPort":80,"ToPort":80,"IpRanges":[{"CidrIp":"0.0.0.0/0"}]}]' >/dev/null 2>&1 || true
+
+  # ✅ RDS 3306 desde ECS privado
   awsq ec2 authorize-security-group-ingress --group-id "$SG_RDS_ID" \
     --ip-permissions "[{\"IpProtocol\":\"tcp\",\"FromPort\":3306,\"ToPort\":3306,\"UserIdGroupPairs\":[{\"GroupId\":\"${SG_ECS_PRIVATE_ID}\"}]}]" >/dev/null 2>&1 || true
 
-  # VPCE SG: 443 desde ECS privado
+  # ✅ VPCE SG: 443 desde ECS privado (para ECR/Logs)
   awsq ec2 authorize-security-group-ingress --group-id "$SG_VPCE_ID" \
     --ip-permissions "[{\"IpProtocol\":\"tcp\",\"FromPort\":443,\"ToPort\":443,\"UserIdGroupPairs\":[{\"GroupId\":\"${SG_ECS_PRIVATE_ID}\"}]}]" >/dev/null 2>&1 || true
-
-  # ✅ MUY IMPORTANTE: ConfigService debe salir a Internet (clonar GitHub) SIN NAT (por estar en subnet pública con IP pública)
-  awsq ec2 authorize-security-group-egress --group-id "$SG_CONFIG_ID" \
-    --ip-permissions '[{"IpProtocol":"-1","IpRanges":[{"CidrIp":"0.0.0.0/0"}]}]' >/dev/null 2>&1 || true
-
-  # ✅ Permitir tráfico interno entre tasks privadas (mismo SG) para Eureka + microservices
-  awsq ec2 authorize-security-group-ingress --group-id "$SG_ECS_PRIVATE_ID" \
-    --ip-permissions "[
-      {\"IpProtocol\":\"tcp\",\"FromPort\":${PORT_EUREKA},\"ToPort\":${PORT_EUREKA},\"UserIdGroupPairs\":[{\"GroupId\":\"${SG_ECS_PRIVATE_ID}\"}]},
-      {\"IpProtocol\":\"tcp\",\"FromPort\":${PORT_PRODUCTS},\"ToPort\":${PORT_PRODUCTS},\"UserIdGroupPairs\":[{\"GroupId\":\"${SG_ECS_PRIVATE_ID}\"}]},
-      {\"IpProtocol\":\"tcp\",\"FromPort\":${PORT_ORDERS},\"ToPort\":${PORT_ORDERS},\"UserIdGroupPairs\":[{\"GroupId\":\"${SG_ECS_PRIVATE_ID}\"}]},
-      {\"IpProtocol\":\"tcp\",\"FromPort\":${PORT_PAY},\"ToPort\":${PORT_PAY},\"UserIdGroupPairs\":[{\"GroupId\":\"${SG_ECS_PRIVATE_ID}\"}]},
-      {\"IpProtocol\":\"tcp\",\"FromPort\":${PORT_USERS},\"ToPort\":${PORT_USERS},\"UserIdGroupPairs\":[{\"GroupId\":\"${SG_ECS_PRIVATE_ID}\"}]}
-    ]" >/dev/null 2>&1 || true
 
   # VPC Endpoints (si existe, ignora)
   awsq ec2 create-vpc-endpoint --vpc-id "$VPC_ID" \
@@ -594,11 +598,16 @@ if ! is_step_done 3; then
   tag_push "${PROJECT}-${REPO_PAY}:latest"      "$REPO_PAY"      "$TAG"
   tag_push "${PROJECT}-${REPO_USERS}:latest"    "$REPO_USERS"    "$TAG"
 
+  if ! awsq ecr describe-images --repository-name "$REPO_CONFIG" --image-ids "imageTag=$TAG" >/dev/null 2>&1; then
+    echo "❌ Push terminó, pero el tag '$TAG' NO aparece en ECR ($REPO_CONFIG)."
+    exit 1
+  fi
+
   step_done 3
 fi
 
 # -------------------------
-# STEP 4) IAM Execution Role (sin permisos SSM extra)
+# STEP 4) IAM Execution Role
 # -------------------------
 if ! is_step_done 4; then
   log "4) IAM execution role..."
@@ -715,9 +724,10 @@ SD_PAY_ID="$(state_get SD_PAY_ID)"
 SD_USERS_ID="$(state_get SD_USERS_ID)"
 
 # -------------------------
-# STEP 8) (Opcional) RDS MySQL (password hardcoded)
+# STEP 8) (Opcional) RDS MySQL
 # -------------------------
-DB_ENDPOINT="$(state_get DB_ENDPOINT 2>/dev/null || echo "")"
+DB_ENDPOINT="$(state_get DB_ENDPOINT)"
+DB_ENDPOINT="${DB_ENDPOINT:-}"
 
 if [[ "${CREATE_RDS}" == "true" ]] && ! is_step_done 8; then
   log "8) RDS MySQL (privado)..."
@@ -773,12 +783,16 @@ if [[ "${CREATE_RDS}" == "true" ]] && ! is_step_done 8; then
   step_done 8
 fi
 
-DB_ENDPOINT="$(state_get DB_ENDPOINT 2>/dev/null || echo "")"
+DB_ENDPOINT="$(state_get DB_ENDPOINT)"
+DB_ENDPOINT="${DB_ENDPOINT:-}"
 
 # -------------------------
 # STEP 9) ALB + Target Group + Listener (solo Gateway)
+# ✅ FIX parser: evitamos "if ! ...; then" por issues en algunos entornos
 # -------------------------
-if ! is_step_done 9; then
+if is_step_done 9; then
+  : # ya hecho
+else
   log "9) ALB + TargetGroup..."
 
   VPC_ID="$(state_get VPC_ID)"
@@ -815,7 +829,6 @@ if ! is_step_done 9; then
   ALB_DNS="$(get_alb_dns "$ALB_ARN")"
   state_set ALB_DNS "$ALB_DNS"
   ok "ALB DNS: $ALB_DNS"
-
   LISTENER_ARN="$(state_get LISTENER_ARN)"
   [[ -z "$LISTENER_ARN" ]] && LISTENER_ARN="$(get_listener_arn_80 "$ALB_ARN")"
   if [[ -z "$LISTENER_ARN" ]]; then
@@ -838,23 +851,23 @@ TG_GW_ARN="$(state_get TG_GW_ARN)"
 ALB_DNS="$(state_get ALB_DNS)"
 
 # -------------------------
-# STEP 10) Task Definitions (env hardcoded) — FIX Git Bash
+# GUARD: validar TAG existe en ECR antes del STEP 10
+# -------------------------
+if ! awsq ecr describe-images --repository-name "$REPO_CONFIG" --image-ids "imageTag=$TAG" >/dev/null 2>&1; then
+  echo "❌ El tag '$TAG' NO existe en ECR para repo '$REPO_CONFIG'."
+  echo "   Solución rápida:"
+  echo "   - borra step_3 y TAG en $STATE_FILE"
+  echo "   - re-ejecuta para rebuild/push y continuar"
+  exit 1
+fi
+
+# -------------------------
+# STEP 10) Task Definitions (env hardcoded) — Git Bash safe
 # -------------------------
 if ! is_step_done 10; then
   log "10) Registrando Task Definitions..."
 
   NETWORK_MODE="awsvpc"
-
-  # ---- Merge JSON arrays sin /tmp ni process substitution ----
-  merge_env() {
-    local a="${1:-[]}"
-    local b="${2:-[]}"
-
-    [[ -z "${a//[[:space:]]/}" ]] && a="[]"
-    [[ -z "${b//[[:space:]]/}" ]] && b="[]"
-
-    jq -cn --argjson A "$a" --argjson B "$b" '$A + $B'
-  }
 
   register_task_def () {
     local family="$1"
@@ -864,14 +877,11 @@ if ! is_step_done 10; then
     local cname="$5"
     local cpu="$6"
     local mem="$7"
-    local env_json="$8"
+    local env_json="${8:-[]}"
 
-    # ---- Seguridad: environment SIEMPRE debe ser array ----
     if ! echo "${env_json:-[]}" | jq -e 'type=="array"' >/dev/null 2>&1; then
       env_json="[]"
     fi
-
-    # Compactar JSON
     env_json="$(echo "$env_json" | jq -c .)"
 
     awsq ecs register-task-definition \
@@ -886,9 +896,7 @@ if ! is_step_done 10; then
           \"name\": \"$cname\",
           \"image\": \"$image\",
           \"essential\": true,
-          \"portMappings\": [
-            {\"containerPort\": $port, \"protocol\": \"tcp\"}
-          ],
+          \"portMappings\": [{\"containerPort\": $port, \"protocol\": \"tcp\"}],
           \"environment\": $env_json,
           \"logConfiguration\": {
             \"logDriver\": \"awslogs\",
@@ -902,8 +910,6 @@ if ! is_step_done 10; then
       ]" \
       | jq -r '.taskDefinition.taskDefinitionArn'
   }
-
-  # ---------------- ENVIRONMENTS ----------------
 
   ENV_CONFIG='[
     {"name":"SPRING_CLOUD_CONFIG_SERVER_GIT_URI","value":"https://github.com/Raulcudris/microservices-fargate-demo.git"},
@@ -930,10 +936,8 @@ if ! is_step_done 10; then
         {"name":"DB_PASS","value":$pass}]')"
   fi
 
-  JWT_ENV="$(jq -nc --arg jwt "$JWT_SECRET" \
-    '[{"name":"JWT_SECRET","value":$jwt}]')"
+  JWT_ENV="$(jq -nc --arg jwt "$JWT_SECRET" '[{"name":"JWT_SECRET","value":$jwt}]')"
 
-  # ---- Merge environments ----
   ENV_PRODUCTS="$(merge_env "$ENV_CLIENT_BASE" "$MYSQL_ENV")"
   ENV_ORDERS="$(merge_env "$ENV_CLIENT_BASE" "$MYSQL_ENV")"
   ENV_PAY="$(merge_env "$ENV_CLIENT_BASE" "$MYSQL_ENV")"
@@ -941,77 +945,13 @@ if ! is_step_done 10; then
   ENV_USERS_BASE="$(merge_env "$ENV_CLIENT_BASE" "$MYSQL_ENV")"
   ENV_USERS="$(merge_env "$ENV_USERS_BASE" "$JWT_ENV")"
 
-  # ---------------- REGISTER TASKS ----------------
-
-  TD_CONFIG_ARN="$(register_task_def \
-    "${PROJECT}-td-config" \
-    "$ECR/$REPO_CONFIG:$TAG" \
-    "$PORT_CONFIG" \
-    "$LG_CONFIG" \
-    "configservice" \
-    "$CPU_SMALL" \
-    "$MEM_SMALL" \
-    "$ENV_CONFIG")"
-
-  TD_EUREKA_ARN="$(register_task_def \
-    "${PROJECT}-td-eureka" \
-    "$ECR/$REPO_EUREKA:$TAG" \
-    "$PORT_EUREKA" \
-    "$LG_EUREKA" \
-    "eurekaservice" \
-    "$CPU_SMALL" \
-    "$MEM_SMALL" \
-    "$ENV_CLIENT_BASE")"
-
-  TD_GATEWAY_ARN="$(register_task_def \
-    "${PROJECT}-td-gateway" \
-    "$ECR/$REPO_GATEWAY:$TAG" \
-    "$PORT_GATEWAY" \
-    "$LG_GATEWAY" \
-    "gatewayservice" \
-    "$CPU_MED" \
-    "$MEM_MED" \
-    "$ENV_CLIENT_BASE")"
-
-  TD_PRODUCTS_ARN="$(register_task_def \
-    "${PROJECT}-td-products" \
-    "$ECR/$REPO_PRODUCTS:$TAG" \
-    "$PORT_PRODUCTS" \
-    "$LG_PRODUCTS" \
-    "productservice" \
-    "$CPU_SMALL" \
-    "$MEM_SMALL" \
-    "$ENV_PRODUCTS")"
-
-  TD_ORDERS_ARN="$(register_task_def \
-    "${PROJECT}-td-orders" \
-    "$ECR/$REPO_ORDERS:$TAG" \
-    "$PORT_ORDERS" \
-    "$LG_ORDERS" \
-    "orderservice" \
-    "$CPU_SMALL" \
-    "$MEM_SMALL" \
-    "$ENV_ORDERS")"
-
-  TD_PAY_ARN="$(register_task_def \
-    "${PROJECT}-td-pay" \
-    "$ECR/$REPO_PAY:$TAG" \
-    "$PORT_PAY" \
-    "$LG_PAY" \
-    "paymentservice" \
-    "$CPU_SMALL" \
-    "$MEM_SMALL" \
-    "$ENV_PAY")"
-
-  TD_USERS_ARN="$(register_task_def \
-    "${PROJECT}-td-users" \
-    "$ECR/$REPO_USERS:$TAG" \
-    "$PORT_USERS" \
-    "$LG_USERS" \
-    "userservice" \
-    "$CPU_SMALL" \
-    "$MEM_SMALL" \
-    "$ENV_USERS")"
+  TD_CONFIG_ARN="$(register_task_def "${PROJECT}-td-config"     "$ECR/$REPO_CONFIG:$TAG"     "$PORT_CONFIG"   "$LG_CONFIG"   "configservice"   "$CPU_SMALL" "$MEM_SMALL" "$ENV_CONFIG")"
+  TD_EUREKA_ARN="$(register_task_def "${PROJECT}-td-eureka"     "$ECR/$REPO_EUREKA:$TAG"     "$PORT_EUREKA"   "$LG_EUREKA"   "eurekaservice"  "$CPU_SMALL" "$MEM_SMALL" "$ENV_CLIENT_BASE")"
+  TD_GATEWAY_ARN="$(register_task_def "${PROJECT}-td-gateway"   "$ECR/$REPO_GATEWAY:$TAG"    "$PORT_GATEWAY"  "$LG_GATEWAY"  "gatewayservice"  "$CPU_MED"   "$MEM_MED"   "$ENV_CLIENT_BASE")"
+  TD_PRODUCTS_ARN="$(register_task_def "${PROJECT}-td-products" "$ECR/$REPO_PRODUCTS:$TAG"   "$PORT_PRODUCTS" "$LG_PRODUCTS" "productservice"   "$CPU_SMALL" "$MEM_SMALL" "$ENV_PRODUCTS")"
+  TD_ORDERS_ARN="$(register_task_def "${PROJECT}-td-orders"     "$ECR/$REPO_ORDERS:$TAG"     "$PORT_ORDERS"   "$LG_ORDERS"   "orderservice"    "$CPU_SMALL" "$MEM_SMALL" "$ENV_ORDERS")"
+  TD_PAY_ARN="$(register_task_def "${PROJECT}-td-pay"           "$ECR/$REPO_PAY:$TAG"        "$PORT_PAY"      "$LG_PAY"      "paymentservice"  "$CPU_SMALL" "$MEM_SMALL" "$ENV_PAY")"
+  TD_USERS_ARN="$(register_task_def "${PROJECT}-td-users"       "$ECR/$REPO_USERS:$TAG"      "$PORT_USERS"    "$LG_USERS"    "userservice"     "$CPU_SMALL" "$MEM_SMALL" "$ENV_USERS")"
 
   state_set TD_CONFIG_ARN "$TD_CONFIG_ARN"
   state_set TD_EUREKA_ARN "$TD_EUREKA_ARN"
@@ -1048,20 +988,20 @@ if ! is_step_done 11; then
   NETCONF_CONFIG="awsvpcConfiguration={subnets=[$PUB1_ID,$PUB2_ID],securityGroups=[$SG_CONFIG_ID],assignPublicIp=ENABLED}"
   NETCONF_PRIVATE="awsvpcConfiguration={subnets=[$PRI1_ID,$PRI2_ID],securityGroups=[$SG_ECS_PRIVATE_ID],assignPublicIp=DISABLED}"
 
-  create_or_update_service_sd "$SVC_CONFIG"   "$TD_CONFIG_ARN"   "$NETCONF_CONFIG"  "$SD_CONFIG_ID"
-  create_or_update_service_sd "$SVC_EUREKA"   "$TD_EUREKA_ARN"   "$NETCONF_PRIVATE" "$SD_EUREKA_ID"
-  create_or_update_service_sd_lb "$SVC_GATEWAY" "$TD_GATEWAY_ARN" "$NETCONF_PRIVATE" "$SD_GATEWAY_ID" \
+  create_or_update_service_sd    "$SVC_CONFIG"    "$TD_CONFIG_ARN"    "$NETCONF_CONFIG"   "$SD_CONFIG_ID"
+  create_or_update_service_sd    "$SVC_EUREKA"    "$TD_EUREKA_ARN"    "$NETCONF_PRIVATE"  "$SD_EUREKA_ID"
+  create_or_update_service_sd_lb "$SVC_GATEWAY"   "$TD_GATEWAY_ARN"   "$NETCONF_PRIVATE"  "$SD_GATEWAY_ID" \
     "$TG_GW_ARN" "gatewayservice" "$PORT_GATEWAY"
-  create_or_update_service_sd "$SVC_PRODUCTS" "$TD_PRODUCTS_ARN" "$NETCONF_PRIVATE" "$SD_PRODUCTS_ID"
-  create_or_update_service_sd "$SVC_ORDERS"   "$TD_ORDERS_ARN"   "$NETCONF_PRIVATE" "$SD_ORDERS_ID"
-  create_or_update_service_sd "$SVC_PAY"      "$TD_PAY_ARN"      "$NETCONF_PRIVATE" "$SD_PAY_ID"
-  create_or_update_service_sd "$SVC_USERS"    "$TD_USERS_ARN"    "$NETCONF_PRIVATE" "$SD_USERS_ID"
+  create_or_update_service_sd    "$SVC_PRODUCTS"  "$TD_PRODUCTS_ARN"  "$NETCONF_PRIVATE"  "$SD_PRODUCTS_ID"
+  create_or_update_service_sd    "$SVC_ORDERS"    "$TD_ORDERS_ARN"    "$NETCONF_PRIVATE"  "$SD_ORDERS_ID"
+  create_or_update_service_sd    "$SVC_PAY"       "$TD_PAY_ARN"       "$NETCONF_PRIVATE"  "$SD_PAY_ID"
+  create_or_update_service_sd    "$SVC_USERS"     "$TD_USERS_ARN"     "$NETCONF_PRIVATE"  "$SD_USERS_ID"
 
   step_done 11
 fi
 
 echo ""
-ok "Deploy completado (resumible/idempotente) — sin NAT, sin SSM."
+ok "Deploy completado (resumible/idempotente)."
 echo "ALB DNS: http://${ALB_DNS}"
 echo "Health:  http://${ALB_DNS}${HEALTH_PATH_GATEWAY}"
 if [[ -n "${DB_ENDPOINT:-}" ]]; then

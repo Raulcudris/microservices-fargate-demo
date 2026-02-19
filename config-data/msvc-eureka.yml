@@ -10,7 +10,6 @@ eureka:
     register-with-eureka: false
     fetch-registry: false
   instance:
-    hostname: eurekaservice
     prefer-ip-address: true
 
 management:
