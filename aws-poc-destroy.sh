@@ -10,14 +10,15 @@ PROJECT="microservices-fargate-demo"
 CLUSTER_NAME="${PROJECT}-cluster"
 ROLE_NAME="${PROJECT}-ecsTaskExecutionRole"
 
-# ALB / Target Group (solo gateway)
-ALB_NAME="${PROJECT}-alb"
-TG_GW_NAME="${PROJECT}-tg-gateway"
+# ⚠️ IMPORTANT: Estos nombres deben coincidir con tu deploy ACTUAL
+# (en tu deploy resumible los pusiste hardcodeados así)
+ALB_NAME="msfd-alb"
+TG_GW_NAME="msfd-tg-gw"
 
-# Security groups creados en el deploy
+# Security groups (según tu deploy actual)
 SG_ALB_NAME="${PROJECT}-sg-alb"
 SG_ECS_PRIVATE_NAME="${PROJECT}-sg-ecs-private"
-SG_CONFIG_PUBLIC_NAME="${PROJECT}-sg-config-public"
+SG_CONFIG_NAME="${PROJECT}-sg-config-egress"   # ✅ antes era sg-config-public
 SG_RDS_NAME="${PROJECT}-sg-rds"
 SG_VPCE_NAME="${PROJECT}-sg-vpce"
 
@@ -41,10 +42,21 @@ LG_USERS="/ecs/${PROJECT}/users"
 FORCE_ECR_DELETE=true
 ECR_REPOS=("configservice" "eurekaservice" "gatewayservice" "productservice" "orderservice" "paymentservice" "userservice")
 
-# RDS (si lo creaste con el deploy)
+# RDS
 DELETE_RDS=true
 DB_INSTANCE_ID="${PROJECT}-mysql"
 DB_SUBNET_GROUP="${PROJECT}-db-subnets"
+
+# Task Definition families (limpieza 100%)
+TD_FAMILIES=(
+  "${PROJECT}-td-config"
+  "${PROJECT}-td-eureka"
+  "${PROJECT}-td-gateway"
+  "${PROJECT}-td-products"
+  "${PROJECT}-td-orders"
+  "${PROJECT}-td-pay"
+  "${PROJECT}-td-users"
+)
 
 # =========================
 # HELPERS
@@ -98,6 +110,21 @@ delete_log_group() {
   fi
 }
 
+delete_taskdef_family() {
+  local family="$1"
+  local arns
+  arns="$(awsq ecs list-task-definitions --family-prefix "$family" --status ACTIVE \
+    --query "taskDefinitionArns[]" --output text 2>/dev/null || true)"
+  if [[ -n "${arns// }" ]]; then
+    for td in $arns; do
+      echo " - Deregister task definition: $td"
+      awsq ecs deregister-task-definition --task-definition "$td" >/dev/null || true
+    done
+  else
+    echo " - No task definitions active for: $family (ok)"
+  fi
+}
+
 # =========================
 # START
 # =========================
@@ -109,7 +136,7 @@ ACCOUNT_ID="$(awsq sts get-caller-identity --query Account --output text)"
 echo "Account: $ACCOUNT_ID"
 
 # -------------------------
-# 0) (Opcional) RDS
+# 0) RDS primero
 # -------------------------
 if [[ "$DELETE_RDS" == "true" ]]; then
   echo "==> 0) Eliminando RDS (si existe)..."
@@ -139,50 +166,35 @@ if exists awsq ecs describe-clusters --clusters "$CLUSTER_NAME" --query "cluster
   if [[ -n "${SERVICES// }" ]]; then
     for svc_arn in $SERVICES; do
       svc_name="$(basename "$svc_arn")"
-      # Solo borramos servicios de este proyecto
-      if [[ "$svc_name" == "configservice" || "$svc_name" == "eurekaservice" || "$svc_name" == "gatewayservice" \
-         || "$svc_name" == "productservice" || "$svc_name" == "orderservice" || "$svc_name" == "paymentservice" || "$svc_name" == "userservice" \
-         || "$svc_name" == *"${PROJECT}"* ]]; then
-        echo " - Deleting service: $svc_name"
-        awsq ecs update-service --cluster "$CLUSTER_NAME" --service "$svc_name" --desired-count 0 >/dev/null || true
-        awsq ecs delete-service --cluster "$CLUSTER_NAME" --service "$svc_name" --force >/dev/null || true
-      fi
+      echo " - Scaling to 0: $svc_name"
+      awsq ecs update-service --cluster "$CLUSTER_NAME" --service "$svc_name" --desired-count 0 >/dev/null || true
+      echo " - Deleting service: $svc_name"
+      awsq ecs delete-service --cluster "$CLUSTER_NAME" --service "$svc_name" --force >/dev/null || true
     done
+  else
+    echo " - No hay servicios ECS (ok)"
   fi
 else
   echo " - Cluster ECS no encontrado (ok)"
 fi
 
 # -------------------------
-# 2) ECS Cluster (delete)
+# 2) Task Definitions (deregister)
 # -------------------------
-echo "==> 2) Eliminando ECS Cluster..."
+echo "==> 2) Deregistrando Task Definitions..."
+for fam in "${TD_FAMILIES[@]}"; do
+  delete_taskdef_family "$fam"
+done
+
+# -------------------------
+# 3) ECS Cluster (delete)
+# -------------------------
+echo "==> 3) Eliminando ECS Cluster..."
 if exists awsq ecs describe-clusters --clusters "$CLUSTER_NAME" --query "clusters[0].status" --output text; then
-  sleep 8
   awsq ecs delete-cluster --cluster "$CLUSTER_NAME" >/dev/null || true
   echo " - Cluster eliminado (o en proceso)"
 else
   echo " - Cluster no encontrado (ok)"
-fi
-
-# -------------------------
-# 3) Cloud Map (namespace + services)
-# -------------------------
-echo "==> 3) Eliminando Cloud Map (namespace + services)..."
-NS_ID="$(awsq servicediscovery list-namespaces --query "Namespaces[?Name=='${NAMESPACE_NAME}'].Id | [0]" --output text 2>/dev/null | grep -v None || true)"
-if [[ -n "${NS_ID}" ]]; then
-  # Borrar servicios dentro del namespace
-  SD_SERVICES="$(awsq servicediscovery list-services --query "Services[?NamespaceId=='${NS_ID}'].Id" --output text 2>/dev/null || true)"
-  if [[ -n "${SD_SERVICES// }" ]]; then
-    for sid in $SD_SERVICES; do
-      echo " - Deleting Cloud Map service: $sid"
-      awsq servicediscovery delete-service --id "$sid" >/dev/null || true
-    done
-  fi
-  echo " - Deleting namespace: $NAMESPACE_NAME"
-  awsq servicediscovery delete-namespace --id "$NS_ID" >/dev/null || true
-else
-  echo " - Namespace no encontrado (ok)"
 fi
 
 # -------------------------
@@ -215,7 +227,6 @@ else
   echo " - ALB no encontrado (ok)"
 fi
 
-# Target group del gateway
 TG_ARN="$(get_tg_arn_by_name "$TG_GW_NAME")"
 if [[ -n "${TG_ARN}" ]]; then
   echo " - Deleting target group: $TG_GW_NAME"
@@ -225,9 +236,66 @@ else
 fi
 
 # -------------------------
-# 5) VPC Endpoints
+# 5) Cloud Map (services + namespace)  ✅ FIX ResourceInUse
 # -------------------------
-echo "==> 5) Eliminando VPC Endpoints..."
+echo "==> 5) Eliminando Cloud Map (namespace + services)..."
+
+NS_ID="$(awsq servicediscovery list-namespaces \
+  --query "Namespaces[?Name=='${NAMESPACE_NAME}'].Id | [0]" --output text 2>/dev/null | grep -v None || true)"
+
+if [[ -n "${NS_ID}" ]]; then
+  echo " - Namespace encontrado: $NAMESPACE_NAME ($NS_ID)"
+
+  # 5.1) Borrar services asociados (si existen)
+  SD_SERVICES="$(awsq servicediscovery list-services \
+    --query "Services[?NamespaceId=='${NS_ID}'].Id" --output text 2>/dev/null || true)"
+
+  if [[ -n "${SD_SERVICES// }" ]]; then
+    for sid in $SD_SERVICES; do
+      echo " - Deleting Cloud Map service: $sid"
+      awsq servicediscovery delete-service --id "$sid" >/dev/null 2>&1 || true
+    done
+  else
+    echo " - No hay servicios asociados (ok)"
+  fi
+
+  # 5.2) Esperar hasta que realmente desaparezcan los services del namespace
+  echo " - Waiting services deletion (Cloud Map async)..."
+  for i in {1..60}; do
+    SD_LEFT="$(awsq servicediscovery list-services \
+      --query "Services[?NamespaceId=='${NS_ID}'].Id" --output text 2>/dev/null || true)"
+
+    if [[ -z "${SD_LEFT// }" ]]; then
+      echo " - Services eliminados."
+      break
+    fi
+
+    echo "   * Aún quedan services: ${SD_LEFT} (intentando de nuevo...)"
+    # Reintenta borrado por si alguno quedó “pegado”
+    for sid in $SD_LEFT; do
+      awsq servicediscovery delete-service --id "$sid" >/dev/null 2>&1 || true
+    done
+    sleep 5
+  done
+
+  # 5.3) Borrar namespace con retry (por si AWS tarda un poco más)
+  echo " - Deleting namespace: $NAMESPACE_NAME ($NS_ID)"
+  for i in {1..20}; do
+    if awsq servicediscovery delete-namespace --id "$NS_ID" >/dev/null 2>&1; then
+      echo " - Namespace eliminado (o en proceso)."
+      break
+    fi
+    echo "   * Namespace aún en uso, reintentando... ($i/20)"
+    sleep 5
+  done
+else
+  echo " - Namespace no encontrado (ok)"
+fi
+
+# -------------------------
+# 6) VPC Endpoints
+# -------------------------
+echo "==> 6) Eliminando VPC Endpoints..."
 VPC_ID="$(get_vpc_id)"
 if [[ -n "${VPC_ID}" ]]; then
   VPCE_IDS="$(awsq ec2 describe-vpc-endpoints --filters "Name=vpc-id,Values=${VPC_ID}" \
@@ -239,13 +307,13 @@ if [[ -n "${VPC_ID}" ]]; then
     echo " - No hay VPC endpoints (ok)"
   fi
 else
-  echo " - VPC no encontrada aún (ok)"
+  echo " - VPC no encontrada (ok)"
 fi
 
 # -------------------------
-# 6) CloudWatch Logs
+# 7) CloudWatch Logs
 # -------------------------
-echo "==> 6) Eliminando CloudWatch Log Groups..."
+echo "==> 7) Eliminando CloudWatch Log Groups..."
 delete_log_group "$LG_CONFIG"
 delete_log_group "$LG_EUREKA"
 delete_log_group "$LG_GATEWAY"
@@ -255,9 +323,9 @@ delete_log_group "$LG_PAY"
 delete_log_group "$LG_USERS"
 
 # -------------------------
-# 7) IAM Role
+# 8) IAM Role
 # -------------------------
-echo "==> 7) Eliminando IAM Role (execution role)..."
+echo "==> 8) Eliminando IAM Role (execution role)..."
 if exists aws iam get-role --role-name "$ROLE_NAME"; then
   aws iam detach-role-policy --role-name "$ROLE_NAME" \
     --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy >/dev/null || true
@@ -268,74 +336,74 @@ else
 fi
 
 # -------------------------
-# 8) Cloud Map Namespace + Services (service discovery interno)
+# 9) Networking (SGs, IGW, RTBs, Subnets, VPC)
 # -------------------------
-echo "==> 8) Creando Cloud Map namespace y servicios..."
+echo "==> 9) Eliminando VPC y networking..."
+VPC_ID="$(get_vpc_id)"
+if [[ -n "${VPC_ID}" ]]; then
+  echo " - VPC: $VPC_ID"
 
-# 8.0) Crear namespace (DEVUELVE OperationId)
-OP_ID="$(aws servicediscovery create-private-dns-namespace \
-  --name "$NAMESPACE_NAME" \
-  --vpc "$VPC_ID" \
-  --region "$REGION" \
-  --description "${PROJECT} private namespace" \
-  --query "OperationId" --output text)"
+  SG_ALB_ID="$(get_sg_id_by_name "$SG_ALB_NAME" "$VPC_ID")"
+  SG_ECS_PRIVATE_ID="$(get_sg_id_by_name "$SG_ECS_PRIVATE_NAME" "$VPC_ID")"
+  SG_CONFIG_ID="$(get_sg_id_by_name "$SG_CONFIG_NAME" "$VPC_ID")"
+  SG_RDS_ID="$(get_sg_id_by_name "$SG_RDS_NAME" "$VPC_ID")"
+  SG_VPCE_ID="$(get_sg_id_by_name "$SG_VPCE_NAME" "$VPC_ID")"
 
-echo " - OperationId: $OP_ID"
+  for sg in "$SG_RDS_ID" "$SG_VPCE_ID" "$SG_CONFIG_ID" "$SG_ECS_PRIVATE_ID" "$SG_ALB_ID"; do
+    if [[ -n "${sg}" && "${sg}" != "None" ]]; then
+      echo " - Deleting SG: $sg"
+      awsq ec2 delete-security-group --group-id "$sg" >/dev/null || true
+    fi
+  done
 
-# 8.1) Esperar a que Cloud Map termine y obtener NamespaceId real
-echo " - Esperando a que el namespace esté listo..."
-for i in {1..30}; do
-  NS_ID="$(aws servicediscovery get-operation \
-    --operation-id "$OP_ID" \
-    --region "$REGION" \
-    --query "Operation.Targets.NAMESPACE" --output text 2>/dev/null || true)"
-
-  if [[ -n "${NS_ID}" && "${NS_ID}" != "None" ]]; then
-    break
+  IGW_ID="$(get_igw_id)"
+  if [[ -n "${IGW_ID}" ]]; then
+    echo " - Detaching IGW: $IGW_ID"
+    awsq ec2 detach-internet-gateway --internet-gateway-id "$IGW_ID" --vpc-id "$VPC_ID" >/dev/null || true
+    echo " - Deleting IGW: $IGW_ID"
+    awsq ec2 delete-internet-gateway --internet-gateway-id "$IGW_ID" >/dev/null || true
   fi
-  sleep 2
-done
 
-if [[ -z "${NS_ID}" || "${NS_ID}" == "None" ]]; then
-  echo "❌ No pude obtener NamespaceId desde la operación $OP_ID"
-  echo "   Prueba a listar namespaces:"
-  aws servicediscovery list-namespaces --region "$REGION" --output table
-  exit 1
+  RTBS="$(awsq ec2 describe-route-tables --filters "Name=vpc-id,Values=$VPC_ID" \
+    --query "RouteTables[].RouteTableId" --output text 2>/dev/null || true)"
+
+  for rtb in $RTBS; do
+    IS_MAIN="$(awsq ec2 describe-route-tables --route-table-ids "$rtb" \
+      --query "RouteTables[0].Associations[?Main==\`true\`].Main | [0]" --output text 2>/dev/null || true)"
+    if [[ "$IS_MAIN" == "True" ]]; then
+      continue
+    fi
+
+    ASSOCS="$(awsq ec2 describe-route-tables --route-table-ids "$rtb" \
+      --query "RouteTables[0].Associations[?Main==\`false\`].RouteTableAssociationId" --output text 2>/dev/null || true)"
+    if [[ -n "${ASSOCS// }" ]]; then
+      for a in $ASSOCS; do
+        echo " - Disassociating RTB assoc: $a"
+        awsq ec2 disassociate-route-table --association-id "$a" >/dev/null || true
+      done
+    fi
+
+    echo " - Deleting route table: $rtb"
+    awsq ec2 delete-route-table --route-table-id "$rtb" >/dev/null || true
+  done
+
+  SUBNETS="$(awsq ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" \
+    --query "Subnets[].SubnetId" --output text 2>/dev/null || true)"
+  for sn in $SUBNETS; do
+    echo " - Deleting subnet: $sn"
+    awsq ec2 delete-subnet --subnet-id "$sn" >/dev/null || true
+  done
+
+  echo " - Deleting VPC: $VPC_ID"
+  awsq ec2 delete-vpc --vpc-id "$VPC_ID" >/dev/null || true
+else
+  echo " - VPC no encontrada (ok)"
 fi
 
-echo " - NamespaceId: $NS_ID"
-
-# 8.2) Crear servicios en ese namespace
-create_sd_service () {
-  local name="$1"
-  aws servicediscovery create-service \
-    --name "$name" --region "$REGION" \
-    --dns-config "NamespaceId=${NS_ID},DnsRecords=[{Type=A,TTL=30}],RoutingPolicy=WEIGHTED" \
-    --health-check-custom-config FailureThreshold=1 \
-    --query "Service.Id" --output text
-}
-
-SD_CONFIG_ID="$(create_sd_service "$SVC_CONFIG")"
-SD_EUREKA_ID="$(create_sd_service "$SVC_EUREKA")"
-SD_GATEWAY_ID="$(create_sd_service "$SVC_GATEWAY")"
-SD_PRODUCTS_ID="$(create_sd_service "$SVC_PRODUCTS")"
-SD_ORDERS_ID="$(create_sd_service "$SVC_ORDERS")"
-SD_PAY_ID="$(create_sd_service "$SVC_PAY")"
-SD_USERS_ID="$(create_sd_service "$SVC_USERS")"
-
-echo "Cloud Map services created:"
-echo " - config : $SD_CONFIG_ID"
-echo " - eureka : $SD_EUREKA_ID"
-echo " - gateway: $SD_GATEWAY_ID"
-echo " - products: $SD_PRODUCTS_ID"
-echo " - orders : $SD_ORDERS_ID"
-echo " - pay    : $SD_PAY_ID"
-echo " - users  : $SD_USERS_ID"
-
 # -------------------------
-# 9) ECR repos (opcional)
+# 10) ECR repos
 # -------------------------
-echo "==> 9) Eliminando ECR repos..."
+echo "==> 10) Eliminando ECR repos..."
 if [[ "$FORCE_ECR_DELETE" == "true" ]]; then
   for repo in "${ECR_REPOS[@]}"; do
     if exists awsq ecr describe-repositories --repository-names "$repo"; then

@@ -2,8 +2,17 @@
 set -euo pipefail
 
 # ============================================================
-# FULL DEPLOY: VPC (Public+Private) + Endpoints + ECR + ECS Fargate
-#            + Cloud Map + ALB (solo Gateway) + RDS MySQL (opcional)
+# RESUMABLE + IDEMPOTENT FULL DEPLOY (AWS) — SIN NAT, SIN SSM
+# - Reusa recursos existentes por TAG/NAME
+# - Guarda estado local (checkpoint) y continúa donde quedó
+# - VPC (public+private) + VPC Endpoints (ECR/Logs/S3) para NO NAT
+# - ECR + build/push
+# - IAM ExecutionRole (solo AmazonECSTaskExecutionRolePolicy)
+# - CloudWatch Logs
+# - ECS Cluster + Cloud Map (Namespace + Services)
+# - (Opcional) RDS MySQL (privado) con password HARDCODED
+# - ALB (solo Gateway)
+# - ECS Services (create-or-update + force-new-deployment)
 # ============================================================
 
 # ✅ FIX Git Bash (MSYS) path conversion:
@@ -26,7 +35,7 @@ DIR_ORDERS="./orderservice"
 DIR_PAY="./paymentservice"
 DIR_USERS="./userservice"
 
-# ECR repos (se crean si no existen)
+# ECR repos
 REPO_CONFIG="configservice"
 REPO_EUREKA="eurekaservice"
 REPO_GATEWAY="gatewayservice"
@@ -53,11 +62,11 @@ PORT_ORDERS=8002
 PORT_PAY=8003
 PORT_USERS=8004
 
-# ALB health check (Gateway)
+# ALB health check (Gateway) — asegúrate que NO requiera auth
 HEALTH_PATH_GATEWAY="/actuator/health"
 
-# Cloud Map (Service Discovery interno)
-NAMESPACE_NAME="${PROJECT}.local"   # DNS interno: configservice.microservices-fargate-demo.local
+# Cloud Map
+NAMESPACE_NAME="${PROJECT}.local"
 
 # VPC CIDRs
 VPC_CIDR="10.20.0.0/16"
@@ -66,7 +75,7 @@ PUB2_CIDR="10.20.2.0/24"
 PRI1_CIDR="10.20.11.0/24"
 PRI2_CIDR="10.20.12.0/24"
 
-# ECS task sizing (ajústalo si necesitas)
+# ECS task sizing
 CPU_SMALL="256"
 MEM_SMALL="512"
 CPU_MED="512"
@@ -76,38 +85,291 @@ MEM_MED="1024"
 CREATE_RDS="true"         # true/false
 DB_NAME="ecommerce_myshop"
 DB_USER="admin"
-DB_PASS="R00t2024**"
+DB_PASS="R00t2024**"      # ⚠️ HARDCODED (como pediste)
 DB_INSTANCE_ID="${PROJECT}-mysql"
-DB_INSTANCE_CLASS="db.t3.micro"    # free-tier friendly (según elegibilidad)
-DB_ALLOCATED_STORAGE="20"          # free-tier friendly
+DB_INSTANCE_CLASS="db.t3.micro"
+DB_ALLOCATED_STORAGE="20"
+DB_STORAGE_TYPE="gp2"
 DB_ENGINE="mysql"
-DB_ENGINE_VERSION="8.0.35"         # puedes ajustar
 
-# JWT (recomendado no hardcode en YAML)
+# JWT (HARDCODED)
 JWT_SECRET="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiYWRtaW4iOnRydWUsImlhdCI6MTUxNjIzOTAyMn0.KMUFsIDTnFmyG3nMiGM6H9FNFUROf3wh7SmqJp-QV30"
+
+# Nombres cortos (limit 32 chars)
+TG_GW_NAME="msfd-tg-gw"
+ALB_NAME="msfd-alb"
+
+# Archivo estado (checkpoint)
+STATE_FILE=".deploy_state.${PROJECT}.${REGION}.json"
 
 # -------------------------
 # HELPERS
 # -------------------------
-need() { command -v "$1" >/dev/null 2>&1 || { echo "❌ Falta '$1' en tu sistema"; exit 1; }; }
+need() { command -v "$1" >/dev/null 2>&1 || { echo "❌ Falta '$1'"; exit 1; }; }
+
+log() { echo -e "👉 $*"; }
+ok()  { echo -e "✅ $*"; }
+warn(){ echo -e "⚠️  $*"; }
+
+state_init() {
+  if [[ ! -f "$STATE_FILE" ]]; then
+    echo '{}' > "$STATE_FILE"
+  fi
+}
+state_get() {
+  local key="$1"
+  jq -r --arg k "$key" '.[$k] // empty' "$STATE_FILE"
+}
+state_set() {
+  local key="$1"; local val="$2"
+  local tmp
+  tmp="$(mktemp)"
+  jq --arg k "$key" --arg v "$val" '.[$k]=$v' "$STATE_FILE" > "$tmp"
+  mv "$tmp" "$STATE_FILE"
+}
+step_done() { state_set "step_${1}" "done"; }
+is_step_done() { [[ "$(state_get "step_${1}")" == "done" ]]; }
+
+on_error() {
+  echo ""
+  echo "❌ Error detectado. Estado guardado en: $STATE_FILE"
+  echo "   Re-ejecuta este script y reusará recursos / continuará."
+}
+trap on_error ERR
+
+awsq() { aws --region "$REGION" "$@"; }
+
+tag_spec() {
+  local rtype="$1"; local name="$2"
+  echo "ResourceType=${rtype},Tags=[{Key=Name,Value=${name}},{Key=Project,Value=${PROJECT}}]"
+}
+
+# -------------------------
+# DISCOVERY HELPERS (idempotencia)
+# -------------------------
+find_vpc() {
+  awsq ec2 describe-vpcs \
+    --filters "Name=tag:Name,Values=${PROJECT}-vpc" "Name=tag:Project,Values=${PROJECT}" \
+    --query "Vpcs[0].VpcId" --output text 2>/dev/null | grep -v "None" || true
+}
+
+find_igw() {
+  awsq ec2 describe-internet-gateways \
+    --filters "Name=tag:Name,Values=${PROJECT}-igw" "Name=attachment.vpc-id,Values=$VPC_ID" \
+    --query "InternetGateways[0].InternetGatewayId" --output text 2>/dev/null | grep -v "None" || true
+}
+
+find_subnet_by_name() {
+  local name="$1"
+  awsq ec2 describe-subnets \
+    --filters "Name=vpc-id,Values=$VPC_ID" "Name=tag:Name,Values=${name}" \
+    --query "Subnets[0].SubnetId" --output text 2>/dev/null | grep -v "None" || true
+}
+
+find_rtb_by_name() {
+  local name="$1"
+  awsq ec2 describe-route-tables \
+    --filters "Name=vpc-id,Values=$VPC_ID" "Name=tag:Name,Values=${name}" \
+    --query "RouteTables[0].RouteTableId" --output text 2>/dev/null | grep -v "None" || true
+}
+
+ensure_sg() {
+  local sg_name="$1"; local desc="$2"; local state_key="$3"
+  local sg_id
+  sg_id="$(state_get "$state_key")"
+  if [[ -z "$sg_id" || "$sg_id" == "None" ]]; then
+    sg_id="$(awsq ec2 describe-security-groups \
+      --filters "Name=vpc-id,Values=$VPC_ID" "Name=group-name,Values=$sg_name" \
+      --query "SecurityGroups[0].GroupId" --output text 2>/dev/null | grep -v "None" || true)"
+  fi
+
+  if [[ -z "$sg_id" ]]; then
+    sg_id="$(awsq ec2 create-security-group --vpc-id "$VPC_ID" --group-name "$sg_name" --description "$desc" \
+      | jq -r '.GroupId')"
+    awsq ec2 create-tags --resources "$sg_id" --tags "Key=Name,Value=$sg_name" "Key=Project,Value=$PROJECT" >/dev/null
+    ok "SG creado: $sg_name -> $sg_id"
+  else
+    ok "SG reusado: $sg_name -> $sg_id"
+  fi
+  state_set "$state_key" "$sg_id"
+  echo "$sg_id"
+}
 
 ensure_repo() {
   local repo="$1"
-  aws ecr describe-repositories --repository-names "$repo" --region "$REGION" >/dev/null 2>&1 \
-  || aws ecr create-repository --repository-name "$repo" --region "$REGION" >/dev/null
+  awsq ecr describe-repositories --repository-names "$repo" >/dev/null 2>&1 \
+    || awsq ecr create-repository --repository-name "$repo" >/dev/null
 }
 
 tag_push() {
-  local local_img="$1"
-  local repo="$2"
-  local tag="$3"
+  local local_img="$1"; local repo="$2"; local tag="$3"
   docker tag "$local_img" "$ECR/$repo:$tag"
   docker tag "$local_img" "$ECR/$repo:latest"
   docker push "$ECR/$repo:$tag"
   docker push "$ECR/$repo:latest"
 }
 
-json_escape() { jq -Rs '.' <<<"${1}"; }
+merge_env() {
+  local a="${1:-[]}"
+  local b="${2:-[]}"
+
+  # Si llegan vacíos, fuerza a array vacío
+  [[ -z "${a//[[:space:]]/}" ]] && a="[]"
+  [[ -z "${b//[[:space:]]/}" ]] && b="[]"
+
+  # Merge de arrays JSON sin /tmp ni /dev/fd
+  jq -cn --argjson A "$a" --argjson B "$b" '$A + $B'
+}
+
+# ---------- Cloud Map helpers ----------
+get_namespace_id_by_name() {
+  awsq servicediscovery list-namespaces \
+    --query "Namespaces[?Name=='${NAMESPACE_NAME}'].Id | [0]" --output text 2>/dev/null | grep -v "None" || true
+}
+
+wait_cloudmap_operation_success() {
+  local op_id="$1"
+  log "Cloud Map: esperando Operation SUCCESS: $op_id"
+  for _i in {1..60}; do
+    local status
+    status="$(awsq servicediscovery get-operation --operation-id "$op_id" \
+      --query "Operation.Status" --output text 2>/dev/null || true)"
+    if [[ "$status" == "SUCCESS" ]]; then return 0; fi
+    if [[ "$status" == "FAIL" || "$status" == "FAILURE" ]]; then
+      echo "❌ Cloud Map operation falló: $op_id"
+      awsq servicediscovery get-operation --operation-id "$op_id" --output json || true
+      exit 1
+    fi
+    sleep 2
+  done
+  echo "❌ Timeout esperando SUCCESS: $op_id"
+  awsq servicediscovery get-operation --operation-id "$op_id" --output json || true
+  exit 1
+}
+
+get_service_id_by_name_and_namespace() {
+  local svc_name="$1"; local ns_id="$2"
+  local ids
+  ids="$(awsq servicediscovery list-services --query "Services[?Name=='${svc_name}'].Id" --output text 2>/dev/null || true)"
+  if [[ -z "${ids// }" ]]; then echo ""; return 0; fi
+  for sid in $ids; do
+    local sid_ns
+    sid_ns="$(awsq servicediscovery get-service --id "$sid" --query "Service.NamespaceId" --output text 2>/dev/null || true)"
+    if [[ "$sid_ns" == "$ns_id" ]]; then echo "$sid"; return 0; fi
+  done
+  echo ""
+}
+
+ensure_sd_service() {
+  local svc_name="$1"; local ns_id="$2"; local state_key="$3"
+  local existing_id
+  existing_id="$(state_get "$state_key")"
+  if [[ -z "$existing_id" ]]; then
+    existing_id="$(get_service_id_by_name_and_namespace "$svc_name" "$ns_id")"
+  fi
+  if [[ -n "$existing_id" ]]; then
+    ok "Cloud Map service reusado: $svc_name -> $existing_id"
+    state_set "$state_key" "$existing_id"
+    echo "$existing_id"
+    return 0
+  fi
+
+  log "Cloud Map: creando service: $svc_name"
+  local out rc
+  set +e
+  out="$(awsq servicediscovery create-service \
+    --name "$svc_name" \
+    --dns-config "NamespaceId=${ns_id},DnsRecords=[{Type=A,TTL=30}],RoutingPolicy=WEIGHTED" \
+    --health-check-custom-config FailureThreshold=1 \
+    --query "Service.Id" --output text 2>&1)"
+  rc=$?
+  set -e
+
+  if [[ $rc -eq 0 ]]; then
+    ok "Cloud Map service creado: $svc_name -> $out"
+    state_set "$state_key" "$out"
+    echo "$out"
+    return 0
+  fi
+
+  if echo "$out" | grep -q "ServiceAlreadyExists"; then
+    local id2
+    id2="$(get_service_id_by_name_and_namespace "$svc_name" "$ns_id")"
+    [[ -n "$id2" ]] || { echo "❌ AlreadyExists pero no encontré ID para $svc_name"; exit 1; }
+    ok "Cloud Map service reusado (AlreadyExists): $svc_name -> $id2"
+    state_set "$state_key" "$id2"
+    echo "$id2"
+    return 0
+  fi
+
+  echo "❌ Error creando Cloud Map service '$svc_name':"
+  echo "$out"
+  exit 1
+}
+
+# ---------- ALB helpers ----------
+get_tg_arn() {
+  awsq elbv2 describe-target-groups \
+    --names "$TG_GW_NAME" --query "TargetGroups[0].TargetGroupArn" --output text 2>/dev/null | grep -v "None" || true
+}
+get_alb_arn() {
+  awsq elbv2 describe-load-balancers \
+    --names "$ALB_NAME" --query "LoadBalancers[0].LoadBalancerArn" --output text 2>/dev/null | grep -v "None" || true
+}
+get_alb_dns() {
+  local alb_arn="$1"
+  awsq elbv2 describe-load-balancers \
+    --load-balancer-arns "$alb_arn" --query "LoadBalancers[0].DNSName" --output text 2>/dev/null | grep -v "None" || true
+}
+get_listener_arn_80() {
+  local alb_arn="$1"
+  awsq elbv2 describe-listeners \
+    --load-balancer-arn "$alb_arn" \
+    --query "Listeners[?Port==\`80\`].ListenerArn | [0]" --output text 2>/dev/null | grep -v "None" || true
+}
+
+# ---------- ECS helpers ----------
+service_exists_ecs() {
+  local svc="$1"
+  awsq ecs describe-services --cluster "$CLUSTER_NAME" --services "$svc" \
+    --query "services[0].status" --output text 2>/dev/null | grep -vq "None"
+}
+
+create_or_update_service_sd() {
+  local svc="$1"; local td="$2"; local net="$3"; local sd_service_id="$4"
+  if service_exists_ecs "$svc"; then
+    log "ECS service existe, actualizando (force-new-deployment): $svc"
+    awsq ecs update-service --cluster "$CLUSTER_NAME" --service "$svc" \
+      --task-definition "$td" --desired-count 1 --force-new-deployment >/dev/null
+    return 0
+  fi
+  awsq ecs create-service --cluster "$CLUSTER_NAME" --service-name "$svc" \
+    --task-definition "$td" --desired-count 1 --launch-type FARGATE \
+    --network-configuration "$net" \
+    --service-registries "registryArn=arn:aws:servicediscovery:${REGION}:${ACCOUNT_ID}:service/${sd_service_id}" \
+    --health-check-grace-period-seconds 120 \
+    >/dev/null
+}
+
+create_or_update_service_sd_lb() {
+  local svc="$1"; local td="$2"; local net="$3"; local sd_service_id="$4"
+  local tg="$5"; local cname="$6"; local cport="$7"
+
+  if service_exists_ecs "$svc"; then
+    log "ECS service existe, actualizando (force-new-deployment): $svc"
+    awsq ecs update-service --cluster "$CLUSTER_NAME" --service "$svc" \
+      --task-definition "$td" --desired-count 1 --force-new-deployment >/dev/null
+    return 0
+  fi
+
+  awsq ecs create-service --cluster "$CLUSTER_NAME" --service-name "$svc" \
+    --task-definition "$td" --desired-count 1 --launch-type FARGATE \
+    --network-configuration "$net" \
+    --service-registries "registryArn=arn:aws:servicediscovery:${REGION}:${ACCOUNT_ID}:service/${sd_service_id}" \
+    --load-balancers "targetGroupArn=$tg,containerName=$cname,containerPort=$cport" \
+    --health-check-grace-period-seconds 180 \
+    >/dev/null
+}
 
 # -------------------------
 # PRECHECKS
@@ -116,282 +378,371 @@ need aws
 need docker
 need jq
 
-echo "==> 0) Identidad AWS..."
+state_init
+
+log "0) Identidad AWS..."
 ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 ECR="${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com"
 TAG="$(date +%Y%m%d-%H%M%S)"
 
-echo "Account: $ACCOUNT_ID"
-echo "Region : $REGION"
-echo "ECR    : $ECR"
-echo "Tag    : $TAG"
+ok "Account: $ACCOUNT_ID"
+ok "Region : $REGION"
+ok "ECR    : $ECR"
+ok "Tag    : $TAG"
 
 # -------------------------
-# 1) VPC + Subnets + IGW + Routes (public + private)
+# STEP 1) VPC + Subnets + IGW + Routes
 # -------------------------
-echo "==> 1) Creando VPC y red (public + private)..."
+if ! is_step_done 1; then
+  log "1) VPC y red (idempotente)..."
 
-AZ1="$(aws ec2 describe-availability-zones --region "$REGION" --query 'AvailabilityZones[0].ZoneName' --output text)"
-AZ2="$(aws ec2 describe-availability-zones --region "$REGION" --query 'AvailabilityZones[1].ZoneName' --output text)"
+  VPC_ID="$(state_get VPC_ID)"
+  [[ -z "$VPC_ID" ]] && VPC_ID="$(find_vpc)"
 
-VPC_ID="$(aws ec2 create-vpc --region "$REGION" --cidr-block "$VPC_CIDR" \
-  --tag-specifications "ResourceType=vpc,Tags=[{Key=Name,Value=${PROJECT}-vpc}]" | jq -r '.Vpc.VpcId')"
+  AZ1="$(awsq ec2 describe-availability-zones --query 'AvailabilityZones[0].ZoneName' --output text)"
+  AZ2="$(awsq ec2 describe-availability-zones --query 'AvailabilityZones[1].ZoneName' --output text)"
 
-aws ec2 modify-vpc-attribute --region "$REGION" --vpc-id "$VPC_ID" --enable-dns-hostnames "{\"Value\":true}" >/dev/null
-aws ec2 modify-vpc-attribute --region "$REGION" --vpc-id "$VPC_ID" --enable-dns-support "{\"Value\":true}" >/dev/null
+  if [[ -z "$VPC_ID" ]]; then
+    VPC_ID="$(awsq ec2 create-vpc --cidr-block "$VPC_CIDR" \
+      --tag-specifications "$(tag_spec vpc "${PROJECT}-vpc")" | jq -r '.Vpc.VpcId')"
+    awsq ec2 modify-vpc-attribute --vpc-id "$VPC_ID" --enable-dns-hostnames "{\"Value\":true}" >/dev/null
+    awsq ec2 modify-vpc-attribute --vpc-id "$VPC_ID" --enable-dns-support "{\"Value\":true}" >/dev/null
+    ok "VPC creada: $VPC_ID"
+  else
+    ok "VPC reusada: $VPC_ID"
+  fi
+  state_set VPC_ID "$VPC_ID"
 
-IGW_ID="$(aws ec2 create-internet-gateway --region "$REGION" \
-  --tag-specifications "ResourceType=internet-gateway,Tags=[{Key=Name,Value=${PROJECT}-igw}]" | jq -r '.InternetGateway.InternetGatewayId')"
-aws ec2 attach-internet-gateway --region "$REGION" --vpc-id "$VPC_ID" --internet-gateway-id "$IGW_ID" >/dev/null
+  IGW_ID="$(state_get IGW_ID)"
+  [[ -z "$IGW_ID" ]] && IGW_ID="$(find_igw)"
+  if [[ -z "$IGW_ID" ]]; then
+    IGW_ID="$(awsq ec2 create-internet-gateway \
+      --tag-specifications "$(tag_spec internet-gateway "${PROJECT}-igw")" | jq -r '.InternetGateway.InternetGatewayId')"
+    awsq ec2 attach-internet-gateway --vpc-id "$VPC_ID" --internet-gateway-id "$IGW_ID" >/dev/null
+    ok "IGW creado+adjuntado: $IGW_ID"
+  else
+    ok "IGW reusado: $IGW_ID"
+  fi
+  state_set IGW_ID "$IGW_ID"
 
-# Public subnets
-PUB1_ID="$(aws ec2 create-subnet --region "$REGION" --vpc-id "$VPC_ID" --cidr-block "$PUB1_CIDR" --availability-zone "$AZ1" \
-  --tag-specifications "ResourceType=subnet,Tags=[{Key=Name,Value=${PROJECT}-public-a}]" | jq -r '.Subnet.SubnetId')"
-PUB2_ID="$(aws ec2 create-subnet --region "$REGION" --vpc-id "$VPC_ID" --cidr-block "$PUB2_CIDR" --availability-zone "$AZ2" \
-  --tag-specifications "ResourceType=subnet,Tags=[{Key=Name,Value=${PROJECT}-public-b}]" | jq -r '.Subnet.SubnetId')"
+  PUB1_ID="$(state_get PUB1_ID)"; [[ -z "$PUB1_ID" ]] && PUB1_ID="$(find_subnet_by_name "${PROJECT}-public-a")"
+  PUB2_ID="$(state_get PUB2_ID)"; [[ -z "$PUB2_ID" ]] && PUB2_ID="$(find_subnet_by_name "${PROJECT}-public-b")"
+  PRI1_ID="$(state_get PRI1_ID)"; [[ -z "$PRI1_ID" ]] && PRI1_ID="$(find_subnet_by_name "${PROJECT}-private-a")"
+  PRI2_ID="$(state_get PRI2_ID)"; [[ -z "$PRI2_ID" ]] && PRI2_ID="$(find_subnet_by_name "${PROJECT}-private-b")"
 
-aws ec2 modify-subnet-attribute --region "$REGION" --subnet-id "$PUB1_ID" --map-public-ip-on-launch >/dev/null
-aws ec2 modify-subnet-attribute --region "$REGION" --subnet-id "$PUB2_ID" --map-public-ip-on-launch >/dev/null
+  if [[ -z "$PUB1_ID" ]]; then
+    PUB1_ID="$(awsq ec2 create-subnet --vpc-id "$VPC_ID" --cidr-block "$PUB1_CIDR" --availability-zone "$AZ1" \
+      --tag-specifications "$(tag_spec subnet "${PROJECT}-public-a")" | jq -r '.Subnet.SubnetId')"
+    awsq ec2 modify-subnet-attribute --subnet-id "$PUB1_ID" --map-public-ip-on-launch >/dev/null
+    ok "Subnet pública A creada: $PUB1_ID"
+  else ok "Subnet pública A reusada: $PUB1_ID"; fi
 
-# Private subnets
-PRI1_ID="$(aws ec2 create-subnet --region "$REGION" --vpc-id "$VPC_ID" --cidr-block "$PRI1_CIDR" --availability-zone "$AZ1" \
-  --tag-specifications "ResourceType=subnet,Tags=[{Key=Name,Value=${PROJECT}-private-a}]" | jq -r '.Subnet.SubnetId')"
-PRI2_ID="$(aws ec2 create-subnet --region "$REGION" --vpc-id "$VPC_ID" --cidr-block "$PRI2_CIDR" --availability-zone "$AZ2" \
-  --tag-specifications "ResourceType=subnet,Tags=[{Key=Name,Value=${PROJECT}-private-b}]" | jq -r '.Subnet.SubnetId')"
+  if [[ -z "$PUB2_ID" ]]; then
+    PUB2_ID="$(awsq ec2 create-subnet --vpc-id "$VPC_ID" --cidr-block "$PUB2_CIDR" --availability-zone "$AZ2" \
+      --tag-specifications "$(tag_spec subnet "${PROJECT}-public-b")" | jq -r '.Subnet.SubnetId')"
+    awsq ec2 modify-subnet-attribute --subnet-id "$PUB2_ID" --map-public-ip-on-launch >/dev/null
+    ok "Subnet pública B creada: $PUB2_ID"
+  else ok "Subnet pública B reusada: $PUB2_ID"; fi
 
-# Public route table -> IGW
-RTB_PUB_ID="$(aws ec2 create-route-table --region "$REGION" --vpc-id "$VPC_ID" \
-  --tag-specifications "ResourceType=route-table,Tags=[{Key=Name,Value=${PROJECT}-public-rtb}]" | jq -r '.RouteTable.RouteTableId')"
+  if [[ -z "$PRI1_ID" ]]; then
+    PRI1_ID="$(awsq ec2 create-subnet --vpc-id "$VPC_ID" --cidr-block "$PRI1_CIDR" --availability-zone "$AZ1" \
+      --tag-specifications "$(tag_spec subnet "${PROJECT}-private-a")" | jq -r '.Subnet.SubnetId')"
+    ok "Subnet privada A creada: $PRI1_ID"
+  else ok "Subnet privada A reusada: $PRI1_ID"; fi
 
-aws ec2 create-route --region "$REGION" --route-table-id "$RTB_PUB_ID" --destination-cidr-block "0.0.0.0/0" --gateway-id "$IGW_ID" >/dev/null
-aws ec2 associate-route-table --region "$REGION" --route-table-id "$RTB_PUB_ID" --subnet-id "$PUB1_ID" >/dev/null
-aws ec2 associate-route-table --region "$REGION" --route-table-id "$RTB_PUB_ID" --subnet-id "$PUB2_ID" >/dev/null
+  if [[ -z "$PRI2_ID" ]]; then
+    PRI2_ID="$(awsq ec2 create-subnet --vpc-id "$VPC_ID" --cidr-block "$PRI2_CIDR" --availability-zone "$AZ2" \
+      --tag-specifications "$(tag_spec subnet "${PROJECT}-private-b")" | jq -r '.Subnet.SubnetId')"
+    ok "Subnet privada B creada: $PRI2_ID"
+  else ok "Subnet privada B reusada: $PRI2_ID"; fi
 
-# Private route table (sin NAT)
-RTB_PRI_ID="$(aws ec2 create-route-table --region "$REGION" --vpc-id "$VPC_ID" \
-  --tag-specifications "ResourceType=route-table,Tags=[{Key=Name,Value=${PROJECT}-private-rtb}]" | jq -r '.RouteTable.RouteTableId')"
-aws ec2 associate-route-table --region "$REGION" --route-table-id "$RTB_PRI_ID" --subnet-id "$PRI1_ID" >/dev/null
-aws ec2 associate-route-table --region "$REGION" --route-table-id "$RTB_PRI_ID" --subnet-id "$PRI2_ID" >/dev/null
+  state_set PUB1_ID "$PUB1_ID"; state_set PUB2_ID "$PUB2_ID"
+  state_set PRI1_ID "$PRI1_ID"; state_set PRI2_ID "$PRI2_ID"
 
-echo "VPC: $VPC_ID"
-echo "Public Subnets : $PUB1_ID, $PUB2_ID"
-echo "Private Subnets: $PRI1_ID, $PRI2_ID"
+  RTB_PUB_ID="$(state_get RTB_PUB_ID)"; [[ -z "$RTB_PUB_ID" ]] && RTB_PUB_ID="$(find_rtb_by_name "${PROJECT}-public-rtb")"
+  if [[ -z "$RTB_PUB_ID" ]]; then
+    RTB_PUB_ID="$(awsq ec2 create-route-table --vpc-id "$VPC_ID" \
+      --tag-specifications "$(tag_spec route-table "${PROJECT}-public-rtb")" | jq -r '.RouteTable.RouteTableId')"
+    ok "RTB pública creada: $RTB_PUB_ID"
+  else ok "RTB pública reusada: $RTB_PUB_ID"; fi
+  state_set RTB_PUB_ID "$RTB_PUB_ID"
 
-# -------------------------
-# 2) Security Groups (ALB, ECS private, Config public, RDS)
-# -------------------------
-echo "==> 2) Creando Security Groups..."
+  awsq ec2 create-route --route-table-id "$RTB_PUB_ID" --destination-cidr-block "0.0.0.0/0" --gateway-id "$IGW_ID" >/dev/null 2>&1 || true
+  awsq ec2 associate-route-table --route-table-id "$RTB_PUB_ID" --subnet-id "$PUB1_ID" >/dev/null 2>&1 || true
+  awsq ec2 associate-route-table --route-table-id "$RTB_PUB_ID" --subnet-id "$PUB2_ID" >/dev/null 2>&1 || true
 
-SG_ALB_ID="$(aws ec2 create-security-group --region "$REGION" --vpc-id "$VPC_ID" \
-  --group-name "${PROJECT}-sg-alb" --description "ALB SG" | jq -r '.GroupId')"
+  RTB_PRI_ID="$(state_get RTB_PRI_ID)"; [[ -z "$RTB_PRI_ID" ]] && RTB_PRI_ID="$(find_rtb_by_name "${PROJECT}-private-rtb")"
+  if [[ -z "$RTB_PRI_ID" ]]; then
+    RTB_PRI_ID="$(awsq ec2 create-route-table --vpc-id "$VPC_ID" \
+      --tag-specifications "$(tag_spec route-table "${PROJECT}-private-rtb")" | jq -r '.RouteTable.RouteTableId')"
+    ok "RTB privada creada: $RTB_PRI_ID"
+  else ok "RTB privada reusada: $RTB_PRI_ID"; fi
+  state_set RTB_PRI_ID "$RTB_PRI_ID"
 
-SG_ECS_PRIVATE_ID="$(aws ec2 create-security-group --region "$REGION" --vpc-id "$VPC_ID" \
-  --group-name "${PROJECT}-sg-ecs-private" --description "ECS Tasks Private SG" | jq -r '.GroupId')"
+  awsq ec2 associate-route-table --route-table-id "$RTB_PRI_ID" --subnet-id "$PRI1_ID" >/dev/null 2>&1 || true
+  awsq ec2 associate-route-table --route-table-id "$RTB_PRI_ID" --subnet-id "$PRI2_ID" >/dev/null 2>&1 || true
 
-SG_CONFIG_PUBLIC_ID="$(aws ec2 create-security-group --region "$REGION" --vpc-id "$VPC_ID" \
-  --group-name "${PROJECT}-sg-config-public" --description "ConfigService Public SG" | jq -r '.GroupId')"
+  ok "VPC: $VPC_ID"
+  ok "Public Subnets : $PUB1_ID, $PUB2_ID"
+  ok "Private Subnets: $PRI1_ID, $PRI2_ID"
 
-SG_RDS_ID="$(aws ec2 create-security-group --region "$REGION" --vpc-id "$VPC_ID" \
-  --group-name "${PROJECT}-sg-rds" --description "RDS MySQL SG" | jq -r '.GroupId')"
-
-# ALB inbound 80 from internet
-aws ec2 authorize-security-group-ingress --region "$REGION" --group-id "$SG_ALB_ID" \
-  --ip-permissions '[{"IpProtocol":"tcp","FromPort":80,"ToPort":80,"IpRanges":[{"CidrIp":"0.0.0.0/0"}]}]' >/dev/null
-
-# ECS private inbound: Gateway 8080 only from ALB SG
-aws ec2 authorize-security-group-ingress --region "$REGION" --group-id "$SG_ECS_PRIVATE_ID" \
-  --ip-permissions "[{\"IpProtocol\":\"tcp\",\"FromPort\":${PORT_GATEWAY},\"ToPort\":${PORT_GATEWAY},\"UserIdGroupPairs\":[{\"GroupId\":\"${SG_ALB_ID}\"}]}]" >/dev/null
-
-# Config public inbound: 8081 only from ECS private SG (NO desde internet)
-aws ec2 authorize-security-group-ingress --region "$REGION" --group-id "$SG_CONFIG_PUBLIC_ID" \
-  --ip-permissions "[{\"IpProtocol\":\"tcp\",\"FromPort\":${PORT_CONFIG},\"ToPort\":${PORT_CONFIG},\"UserIdGroupPairs\":[{\"GroupId\":\"${SG_ECS_PRIVATE_ID}\"}]}]" >/dev/null
-
-# RDS inbound 3306 only from ECS private SG
-aws ec2 authorize-security-group-ingress --region "$REGION" --group-id "$SG_RDS_ID" \
-  --ip-permissions "[{\"IpProtocol\":\"tcp\",\"FromPort\":3306,\"ToPort\":3306,\"UserIdGroupPairs\":[{\"GroupId\":\"${SG_ECS_PRIVATE_ID}\"}]}]" >/dev/null
-
-echo "SG ALB         : $SG_ALB_ID"
-echo "SG ECS Private  : $SG_ECS_PRIVATE_ID"
-echo "SG Config Public: $SG_CONFIG_PUBLIC_ID"
-echo "SG RDS          : $SG_RDS_ID"
-
-# -------------------------
-# 3) VPC Endpoints (para que tasks privadas usen ECR/Logs sin NAT)
-# -------------------------
-echo "==> 3) Creando VPC Endpoints (ECR API, ECR DKR, CloudWatch Logs, S3)..."
-
-# Security group para Interface Endpoints
-SG_VPCE_ID="$(aws ec2 create-security-group --region "$REGION" --vpc-id "$VPC_ID" \
-  --group-name "${PROJECT}-sg-vpce" --description "VPC Endpoints SG" | jq -r '.GroupId')"
-
-# Permitir HTTPS desde ECS private SG hacia endpoints
-aws ec2 authorize-security-group-ingress --region "$REGION" --group-id "$SG_VPCE_ID" \
-  --ip-permissions "[{\"IpProtocol\":\"tcp\",\"FromPort\":443,\"ToPort\":443,\"UserIdGroupPairs\":[{\"GroupId\":\"${SG_ECS_PRIVATE_ID}\"}]}]" >/dev/null
-
-# Interface Endpoints
-aws ec2 create-vpc-endpoint --region "$REGION" --vpc-id "$VPC_ID" \
-  --vpc-endpoint-type Interface --service-name "com.amazonaws.${REGION}.ecr.api" \
-  --subnet-ids "$PRI1_ID" "$PRI2_ID" --security-group-ids "$SG_VPCE_ID" --private-dns-enabled >/dev/null
-
-aws ec2 create-vpc-endpoint --region "$REGION" --vpc-id "$VPC_ID" \
-  --vpc-endpoint-type Interface --service-name "com.amazonaws.${REGION}.ecr.dkr" \
-  --subnet-ids "$PRI1_ID" "$PRI2_ID" --security-group-ids "$SG_VPCE_ID" --private-dns-enabled >/dev/null
-
-aws ec2 create-vpc-endpoint --region "$REGION" --vpc-id "$VPC_ID" \
-  --vpc-endpoint-type Interface --service-name "com.amazonaws.${REGION}.logs" \
-  --subnet-ids "$PRI1_ID" "$PRI2_ID" --security-group-ids "$SG_VPCE_ID" --private-dns-enabled >/dev/null
-
-# Gateway Endpoint for S3 (ECR layers)
-aws ec2 create-vpc-endpoint --region "$REGION" --vpc-id "$VPC_ID" \
-  --vpc-endpoint-type Gateway --service-name "com.amazonaws.${REGION}.s3" \
-  --route-table-ids "$RTB_PRI_ID" >/dev/null
-
-# -------------------------
-# 4) ECR repos + login + build + push
-# -------------------------
-echo "==> 4) ECR repos + login + build/push..."
-
-ensure_repo "$REPO_CONFIG"
-ensure_repo "$REPO_EUREKA"
-ensure_repo "$REPO_GATEWAY"
-ensure_repo "$REPO_PRODUCTS"
-ensure_repo "$REPO_ORDERS"
-ensure_repo "$REPO_PAY"
-ensure_repo "$REPO_USERS"
-
-aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "$ECR"
-
-echo "   - Build imágenes (docker build por servicio)..."
-docker build -t "${PROJECT}-${REPO_CONFIG}:latest"   "$DIR_CONFIG"
-docker build -t "${PROJECT}-${REPO_EUREKA}:latest"   "$DIR_EUREKA"
-docker build -t "${PROJECT}-${REPO_GATEWAY}:latest"  "$DIR_GATEWAY"
-docker build -t "${PROJECT}-${REPO_PRODUCTS}:latest" "$DIR_PRODUCTS"
-docker build -t "${PROJECT}-${REPO_ORDERS}:latest"   "$DIR_ORDERS"
-docker build -t "${PROJECT}-${REPO_PAY}:latest"      "$DIR_PAY"
-docker build -t "${PROJECT}-${REPO_USERS}:latest"    "$DIR_USERS"
-
-echo "   - Tag/push con tag: $TAG (y latest)..."
-tag_push "${PROJECT}-${REPO_CONFIG}:latest"   "$REPO_CONFIG"   "$TAG"
-tag_push "${PROJECT}-${REPO_EUREKA}:latest"   "$REPO_EUREKA"   "$TAG"
-tag_push "${PROJECT}-${REPO_GATEWAY}:latest"  "$REPO_GATEWAY"  "$TAG"
-tag_push "${PROJECT}-${REPO_PRODUCTS}:latest" "$REPO_PRODUCTS" "$TAG"
-tag_push "${PROJECT}-${REPO_ORDERS}:latest"   "$REPO_ORDERS"   "$TAG"
-tag_push "${PROJECT}-${REPO_PAY}:latest"      "$REPO_PAY"      "$TAG"
-tag_push "${PROJECT}-${REPO_USERS}:latest"    "$REPO_USERS"    "$TAG"
-
-# -------------------------
-# 5) IAM Role for ECS Tasks (execution role)
-# -------------------------
-echo "==> 5) IAM execution role para ECS tasks..."
-ROLE_NAME="${PROJECT}-ecsTaskExecutionRole"
-
-TRUST_POLICY='{
-  "Version":"2012-10-17",
-  "Statement":[{"Effect":"Allow","Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"}]
-}'
-
-ROLE_ARN="$(aws iam get-role --role-name "$ROLE_NAME" --query Role.Arn --output text 2>/dev/null || true)"
-if [[ -z "${ROLE_ARN}" || "${ROLE_ARN}" == "None" ]]; then
-  ROLE_ARN="$(aws iam create-role --role-name "$ROLE_NAME" --assume-role-policy-document "$TRUST_POLICY" | jq -r '.Role.Arn')"
-  aws iam attach-role-policy --role-name "$ROLE_NAME" \
-    --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy >/dev/null
+  step_done 1
 fi
-echo "ExecutionRole: $ROLE_ARN"
 
 # -------------------------
-# 6) CloudWatch Log Groups
+# STEP 2) Security Groups + VPC Endpoints (sin NAT)
 # -------------------------
-echo "==> 6) Log groups (CloudWatch)..."
-mklog() { aws logs create-log-group --log-group-name "$1" --region "$REGION" >/dev/null 2>&1 || true; }
+if ! is_step_done 2; then
+  log "2) SG + VPC Endpoints (sin NAT)..."
 
-LG_CONFIG="/ecs/${PROJECT}/config"
-LG_EUREKA="/ecs/${PROJECT}/eureka"
-LG_GATEWAY="/ecs/${PROJECT}/gateway"
-LG_PRODUCTS="/ecs/${PROJECT}/products"
-LG_ORDERS="/ecs/${PROJECT}/orders"
-LG_PAY="/ecs/${PROJECT}/pay"
-LG_USERS="/ecs/${PROJECT}/users"
+  VPC_ID="$(state_get VPC_ID)"
+  PRI1_ID="$(state_get PRI1_ID)"
+  PRI2_ID="$(state_get PRI2_ID)"
+  RTB_PRI_ID="$(state_get RTB_PRI_ID)"
 
-mklog "$LG_CONFIG"
-mklog "$LG_EUREKA"
-mklog "$LG_GATEWAY"
-mklog "$LG_PRODUCTS"
-mklog "$LG_ORDERS"
-mklog "$LG_PAY"
-mklog "$LG_USERS"
+  SG_ALB_ID="$(ensure_sg "${PROJECT}-sg-alb" "ALB SG" "SG_ALB_ID")"
+  SG_ECS_PRIVATE_ID="$(ensure_sg "${PROJECT}-sg-ecs-private" "ECS Tasks Private SG" "SG_ECS_PRIVATE_ID")"
+  SG_CONFIG_ID="$(ensure_sg "${PROJECT}-sg-config-egress" "ConfigService SG (public subnet but private ingress)" "SG_CONFIG_ID")"
+  SG_RDS_ID="$(ensure_sg "${PROJECT}-sg-rds" "RDS MySQL SG" "SG_RDS_ID")"
+  SG_VPCE_ID="$(ensure_sg "${PROJECT}-sg-vpce" "VPC Endpoints SG" "SG_VPCE_ID")"
+
+  # ALB inbound 80
+  awsq ec2 authorize-security-group-ingress --group-id "$SG_ALB_ID" \
+    --ip-permissions '[{"IpProtocol":"tcp","FromPort":80,"ToPort":80,"IpRanges":[{"CidrIp":"0.0.0.0/0"}]}]' >/dev/null 2>&1 || true
+
+  # Gateway 8080 desde ALB
+  awsq ec2 authorize-security-group-ingress --group-id "$SG_ECS_PRIVATE_ID" \
+    --ip-permissions "[{\"IpProtocol\":\"tcp\",\"FromPort\":${PORT_GATEWAY},\"ToPort\":${PORT_GATEWAY},\"UserIdGroupPairs\":[{\"GroupId\":\"${SG_ALB_ID}\"}]}]" >/dev/null 2>&1 || true
+
+  # Config 8081 desde ECS privado
+  awsq ec2 authorize-security-group-ingress --group-id "$SG_CONFIG_ID" \
+    --ip-permissions "[{\"IpProtocol\":\"tcp\",\"FromPort\":${PORT_CONFIG},\"ToPort\":${PORT_CONFIG},\"UserIdGroupPairs\":[{\"GroupId\":\"${SG_ECS_PRIVATE_ID}\"}]}]" >/dev/null 2>&1 || true
+
+  # RDS 3306 desde ECS privado
+  awsq ec2 authorize-security-group-ingress --group-id "$SG_RDS_ID" \
+    --ip-permissions "[{\"IpProtocol\":\"tcp\",\"FromPort\":3306,\"ToPort\":3306,\"UserIdGroupPairs\":[{\"GroupId\":\"${SG_ECS_PRIVATE_ID}\"}]}]" >/dev/null 2>&1 || true
+
+  # VPCE SG: 443 desde ECS privado
+  awsq ec2 authorize-security-group-ingress --group-id "$SG_VPCE_ID" \
+    --ip-permissions "[{\"IpProtocol\":\"tcp\",\"FromPort\":443,\"ToPort\":443,\"UserIdGroupPairs\":[{\"GroupId\":\"${SG_ECS_PRIVATE_ID}\"}]}]" >/dev/null 2>&1 || true
+
+  # ✅ MUY IMPORTANTE: ConfigService debe salir a Internet (clonar GitHub) SIN NAT (por estar en subnet pública con IP pública)
+  awsq ec2 authorize-security-group-egress --group-id "$SG_CONFIG_ID" \
+    --ip-permissions '[{"IpProtocol":"-1","IpRanges":[{"CidrIp":"0.0.0.0/0"}]}]' >/dev/null 2>&1 || true
+
+  # ✅ Permitir tráfico interno entre tasks privadas (mismo SG) para Eureka + microservices
+  awsq ec2 authorize-security-group-ingress --group-id "$SG_ECS_PRIVATE_ID" \
+    --ip-permissions "[
+      {\"IpProtocol\":\"tcp\",\"FromPort\":${PORT_EUREKA},\"ToPort\":${PORT_EUREKA},\"UserIdGroupPairs\":[{\"GroupId\":\"${SG_ECS_PRIVATE_ID}\"}]},
+      {\"IpProtocol\":\"tcp\",\"FromPort\":${PORT_PRODUCTS},\"ToPort\":${PORT_PRODUCTS},\"UserIdGroupPairs\":[{\"GroupId\":\"${SG_ECS_PRIVATE_ID}\"}]},
+      {\"IpProtocol\":\"tcp\",\"FromPort\":${PORT_ORDERS},\"ToPort\":${PORT_ORDERS},\"UserIdGroupPairs\":[{\"GroupId\":\"${SG_ECS_PRIVATE_ID}\"}]},
+      {\"IpProtocol\":\"tcp\",\"FromPort\":${PORT_PAY},\"ToPort\":${PORT_PAY},\"UserIdGroupPairs\":[{\"GroupId\":\"${SG_ECS_PRIVATE_ID}\"}]},
+      {\"IpProtocol\":\"tcp\",\"FromPort\":${PORT_USERS},\"ToPort\":${PORT_USERS},\"UserIdGroupPairs\":[{\"GroupId\":\"${SG_ECS_PRIVATE_ID}\"}]}
+    ]" >/dev/null 2>&1 || true
+
+  # VPC Endpoints (si existe, ignora)
+  awsq ec2 create-vpc-endpoint --vpc-id "$VPC_ID" \
+    --vpc-endpoint-type Interface --service-name "com.amazonaws.${REGION}.ecr.api" \
+    --subnet-ids "$PRI1_ID" "$PRI2_ID" --security-group-ids "$SG_VPCE_ID" --private-dns-enabled >/dev/null 2>&1 || true
+
+  awsq ec2 create-vpc-endpoint --vpc-id "$VPC_ID" \
+    --vpc-endpoint-type Interface --service-name "com.amazonaws.${REGION}.ecr.dkr" \
+    --subnet-ids "$PRI1_ID" "$PRI2_ID" --security-group-ids "$SG_VPCE_ID" --private-dns-enabled >/dev/null 2>&1 || true
+
+  awsq ec2 create-vpc-endpoint --vpc-id "$VPC_ID" \
+    --vpc-endpoint-type Interface --service-name "com.amazonaws.${REGION}.logs" \
+    --subnet-ids "$PRI1_ID" "$PRI2_ID" --security-group-ids "$SG_VPCE_ID" --private-dns-enabled >/dev/null 2>&1 || true
+
+  awsq ec2 create-vpc-endpoint --vpc-id "$VPC_ID" \
+    --vpc-endpoint-type Gateway --service-name "com.amazonaws.${REGION}.s3" \
+    --route-table-ids "$RTB_PRI_ID" >/dev/null 2>&1 || true
+
+  step_done 2
+fi
 
 # -------------------------
-# 7) ECS Cluster
+# STEP 3) ECR + build/push
 # -------------------------
-echo "==> 7) Creando cluster ECS..."
-aws ecs create-cluster --cluster-name "$CLUSTER_NAME" --region "$REGION" >/dev/null 2>&1 || true
+if ! is_step_done 3; then
+  log "3) ECR repos + login + build/push..."
+
+  ensure_repo "$REPO_CONFIG"
+  ensure_repo "$REPO_EUREKA"
+  ensure_repo "$REPO_GATEWAY"
+  ensure_repo "$REPO_PRODUCTS"
+  ensure_repo "$REPO_ORDERS"
+  ensure_repo "$REPO_PAY"
+  ensure_repo "$REPO_USERS"
+
+  aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "$ECR"
+
+  log "Build imágenes..."
+  docker build -t "${PROJECT}-${REPO_CONFIG}:latest"   "$DIR_CONFIG"
+  docker build -t "${PROJECT}-${REPO_EUREKA}:latest"   "$DIR_EUREKA"
+  docker build -t "${PROJECT}-${REPO_GATEWAY}:latest"  "$DIR_GATEWAY"
+  docker build -t "${PROJECT}-${REPO_PRODUCTS}:latest" "$DIR_PRODUCTS"
+  docker build -t "${PROJECT}-${REPO_ORDERS}:latest"   "$DIR_ORDERS"
+  docker build -t "${PROJECT}-${REPO_PAY}:latest"      "$DIR_PAY"
+  docker build -t "${PROJECT}-${REPO_USERS}:latest"    "$DIR_USERS"
+
+  log "Push a ECR (tag=$TAG y latest)..."
+  tag_push "${PROJECT}-${REPO_CONFIG}:latest"   "$REPO_CONFIG"   "$TAG"
+  tag_push "${PROJECT}-${REPO_EUREKA}:latest"   "$REPO_EUREKA"   "$TAG"
+  tag_push "${PROJECT}-${REPO_GATEWAY}:latest"  "$REPO_GATEWAY"  "$TAG"
+  tag_push "${PROJECT}-${REPO_PRODUCTS}:latest" "$REPO_PRODUCTS" "$TAG"
+  tag_push "${PROJECT}-${REPO_ORDERS}:latest"   "$REPO_ORDERS"   "$TAG"
+  tag_push "${PROJECT}-${REPO_PAY}:latest"      "$REPO_PAY"      "$TAG"
+  tag_push "${PROJECT}-${REPO_USERS}:latest"    "$REPO_USERS"    "$TAG"
+
+  step_done 3
+fi
 
 # -------------------------
-# 8) Cloud Map Namespace + Services (service discovery interno)
+# STEP 4) IAM Execution Role (sin permisos SSM extra)
 # -------------------------
-echo "==> 8) Creando Cloud Map namespace y servicios..."
+if ! is_step_done 4; then
+  log "4) IAM execution role..."
+  ROLE_NAME="${PROJECT}-ecsTaskExecutionRole"
 
-NAMESPACE_ID="$(aws servicediscovery create-private-dns-namespace \
-  --name "$NAMESPACE_NAME" --vpc "$VPC_ID" --region "$REGION" \
-  --description "${PROJECT} private namespace" | jq -r '.OperationId')"
+  TRUST_POLICY='{
+    "Version":"2012-10-17",
+    "Statement":[{"Effect":"Allow","Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"}]
+  }'
 
-# Espera corta a que namespace quede listo
-sleep 5
-
-create_sd_service () {
-  local name="$1"
-  aws servicediscovery create-service --name "$name" --region "$REGION" \
-    --dns-config "NamespaceId=$(aws servicediscovery list-namespaces --region "$REGION" | jq -r ".Namespaces[] | select(.Name==\"$NAMESPACE_NAME\") | .Id"),DnsRecords=[{Type=A,TTL=30}],RoutingPolicy=WEIGHTED" \
-    --health-check-custom-config FailureThreshold=1 \
-  | jq -r '.Service.Id'
-}
-
-SD_CONFIG_ID="$(create_sd_service "$SVC_CONFIG")"
-SD_EUREKA_ID="$(create_sd_service "$SVC_EUREKA")"
-SD_GATEWAY_ID="$(create_sd_service "$SVC_GATEWAY")"
-SD_PRODUCTS_ID="$(create_sd_service "$SVC_PRODUCTS")"
-SD_ORDERS_ID="$(create_sd_service "$SVC_ORDERS")"
-SD_PAY_ID="$(create_sd_service "$SVC_PAY")"
-SD_USERS_ID="$(create_sd_service "$SVC_USERS")"
-
-echo "Cloud Map services created."
+  ROLE_ARN="$(aws iam get-role --role-name "$ROLE_NAME" --query Role.Arn --output text 2>/dev/null || true)"
+  if [[ -z "$ROLE_ARN" || "$ROLE_ARN" == "None" ]]; then
+    ROLE_ARN="$(aws iam create-role --role-name "$ROLE_NAME" --assume-role-policy-document "$TRUST_POLICY" | jq -r '.Role.Arn')"
+    aws iam attach-role-policy --role-name "$ROLE_NAME" \
+      --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy >/dev/null
+    ok "Role creado: $ROLE_ARN"
+  else
+    ok "Role reusado: $ROLE_ARN"
+  fi
+  state_set ROLE_ARN "$ROLE_ARN"
+  step_done 4
+fi
+ROLE_ARN="$(state_get ROLE_ARN)"
 
 # -------------------------
-# 9) (Opcional) RDS MySQL en subnets privadas (Free Tier-friendly)
+# STEP 5) CloudWatch Logs
 # -------------------------
-DB_ENDPOINT=""
-if [[ "${CREATE_RDS}" == "true" ]]; then
-  echo "==> 9) Creando RDS MySQL (privado)..."
+if ! is_step_done 5; then
+  log "5) Log groups..."
+  mklog() { awsq logs create-log-group --log-group-name "$1" >/dev/null 2>&1 || true; }
 
-  # Asegura engine mysql (free tier aplica a RDS MySQL, no Aurora)
-  DB_ENGINE="mysql"
-  DB_INSTANCE_CLASS="${DB_INSTANCE_CLASS:-db.t3.micro}"
-  DB_ALLOCATED_STORAGE="${DB_ALLOCATED_STORAGE:-20}"
-  DB_STORAGE_TYPE="${DB_STORAGE_TYPE:-gp2}"
+  LG_CONFIG="/ecs/${PROJECT}/config"
+  LG_EUREKA="/ecs/${PROJECT}/eureka"
+  LG_GATEWAY="/ecs/${PROJECT}/gateway"
+  LG_PRODUCTS="/ecs/${PROJECT}/products"
+  LG_ORDERS="/ecs/${PROJECT}/orders"
+  LG_PAY="/ecs/${PROJECT}/pay"
+  LG_USERS="/ecs/${PROJECT}/users"
 
-  # Obtener una versión válida en la región (default)
-  DB_ENGINE_VERSION="$(aws rds describe-db-engine-versions --region "$REGION" \
+  mklog "$LG_CONFIG"; mklog "$LG_EUREKA"; mklog "$LG_GATEWAY"
+  mklog "$LG_PRODUCTS"; mklog "$LG_ORDERS"; mklog "$LG_PAY"; mklog "$LG_USERS"
+
+  state_set LG_CONFIG "$LG_CONFIG"
+  state_set LG_EUREKA "$LG_EUREKA"
+  state_set LG_GATEWAY "$LG_GATEWAY"
+  state_set LG_PRODUCTS "$LG_PRODUCTS"
+  state_set LG_ORDERS "$LG_ORDERS"
+  state_set LG_PAY "$LG_PAY"
+  state_set LG_USERS "$LG_USERS"
+
+  step_done 5
+fi
+
+LG_CONFIG="$(state_get LG_CONFIG)"
+LG_EUREKA="$(state_get LG_EUREKA)"
+LG_GATEWAY="$(state_get LG_GATEWAY)"
+LG_PRODUCTS="$(state_get LG_PRODUCTS)"
+LG_ORDERS="$(state_get LG_ORDERS)"
+LG_PAY="$(state_get LG_PAY)"
+LG_USERS="$(state_get LG_USERS)"
+
+# -------------------------
+# STEP 6) ECS Cluster
+# -------------------------
+if ! is_step_done 6; then
+  log "6) ECS Cluster..."
+  awsq ecs create-cluster --cluster-name "$CLUSTER_NAME" >/dev/null 2>&1 || true
+  ok "Cluster listo: $CLUSTER_NAME"
+  step_done 6
+fi
+
+# -------------------------
+# STEP 7) Cloud Map Namespace + Services
+# -------------------------
+if ! is_step_done 7; then
+  log "7) Cloud Map namespace + services..."
+
+  VPC_ID="$(state_get VPC_ID)"
+
+  NS_ID="$(state_get NS_ID)"
+  [[ -z "$NS_ID" ]] && NS_ID="$(get_namespace_id_by_name)"
+
+  if [[ -z "$NS_ID" ]]; then
+    log "Namespace no existe, creando..."
+    OP_ID="$(awsq servicediscovery create-private-dns-namespace \
+      --name "$NAMESPACE_NAME" --vpc "$VPC_ID" --description "${PROJECT} private namespace" \
+      --query "OperationId" --output text)"
+    wait_cloudmap_operation_success "$OP_ID"
+    NS_ID="$(get_namespace_id_by_name)"
+    [[ -n "$NS_ID" ]] || { echo "❌ No pude resolver NamespaceId"; exit 1; }
+    ok "Namespace creado: $NS_ID"
+  else
+    ok "Namespace reusado: $NS_ID"
+  fi
+  state_set NS_ID "$NS_ID"
+
+  SD_CONFIG_ID="$(ensure_sd_service "$SVC_CONFIG" "$NS_ID" "SD_CONFIG_ID")"
+  SD_EUREKA_ID="$(ensure_sd_service "$SVC_EUREKA" "$NS_ID" "SD_EUREKA_ID")"
+  SD_GATEWAY_ID="$(ensure_sd_service "$SVC_GATEWAY" "$NS_ID" "SD_GATEWAY_ID")"
+  SD_PRODUCTS_ID="$(ensure_sd_service "$SVC_PRODUCTS" "$NS_ID" "SD_PRODUCTS_ID")"
+  SD_ORDERS_ID="$(ensure_sd_service "$SVC_ORDERS" "$NS_ID" "SD_ORDERS_ID")"
+  SD_PAY_ID="$(ensure_sd_service "$SVC_PAY" "$NS_ID" "SD_PAY_ID")"
+  SD_USERS_ID="$(ensure_sd_service "$SVC_USERS" "$NS_ID" "SD_USERS_ID")"
+
+  step_done 7
+fi
+
+SD_CONFIG_ID="$(state_get SD_CONFIG_ID)"
+SD_EUREKA_ID="$(state_get SD_EUREKA_ID)"
+SD_GATEWAY_ID="$(state_get SD_GATEWAY_ID)"
+SD_PRODUCTS_ID="$(state_get SD_PRODUCTS_ID)"
+SD_ORDERS_ID="$(state_get SD_ORDERS_ID)"
+SD_PAY_ID="$(state_get SD_PAY_ID)"
+SD_USERS_ID="$(state_get SD_USERS_ID)"
+
+# -------------------------
+# STEP 8) (Opcional) RDS MySQL (password hardcoded)
+# -------------------------
+DB_ENDPOINT="$(state_get DB_ENDPOINT 2>/dev/null || echo "")"
+
+if [[ "${CREATE_RDS}" == "true" ]] && ! is_step_done 8; then
+  log "8) RDS MySQL (privado)..."
+
+  DB_ENGINE_VERSION="$(awsq rds describe-db-engine-versions \
     --engine "$DB_ENGINE" --default-only \
     --query "DBEngineVersions[0].EngineVersion" --output text)"
 
-  if [[ -z "$DB_ENGINE_VERSION" || "$DB_ENGINE_VERSION" == "None" ]]; then
-    echo "❌ No pude resolver DB_ENGINE_VERSION default para engine=$DB_ENGINE en region=$REGION"
+  if [[ -z "${DB_ENGINE_VERSION:-}" || "${DB_ENGINE_VERSION}" == "None" ]]; then
+    echo "❌ No pude resolver engine version default"
     exit 1
   fi
+  ok "RDS EngineVersion(default): $DB_ENGINE_VERSION"
 
-  echo "   - Engine: $DB_ENGINE"
-  echo "   - EngineVersion(default): $DB_ENGINE_VERSION"
-  echo "   - Class: $DB_INSTANCE_CLASS | Storage: ${DB_ALLOCATED_STORAGE}GB $DB_STORAGE_TYPE"
+  PRI1_ID="$(state_get PRI1_ID)"
+  PRI2_ID="$(state_get PRI2_ID)"
+  SG_RDS_ID="$(state_get SG_RDS_ID)"
 
-  # DB Subnet Group
-  aws rds create-db-subnet-group --region "$REGION" \
+  awsq rds create-db-subnet-group \
     --db-subnet-group-name "${PROJECT}-db-subnets" \
     --db-subnet-group-description "Private subnets for RDS" \
     --subnet-ids "$PRI1_ID" "$PRI2_ID" >/dev/null 2>&1 || true
 
-  # Crear DB (si no existe)
-  if ! aws rds describe-db-instances --region "$REGION" --db-instance-identifier "$DB_INSTANCE_ID" >/dev/null 2>&1; then
-    aws rds create-db-instance --region "$REGION" \
+  if ! awsq rds describe-db-instances --db-instance-identifier "$DB_INSTANCE_ID" >/dev/null 2>&1; then
+    awsq rds create-db-instance \
       --db-instance-identifier "$DB_INSTANCE_ID" \
       --db-instance-class "$DB_INSTANCE_CLASS" \
       --engine "$DB_ENGINE" \
@@ -406,184 +757,314 @@ if [[ "${CREATE_RDS}" == "true" ]]; then
       --no-publicly-accessible \
       --backup-retention-period 0 \
       --no-multi-az >/dev/null
+    ok "RDS creado: $DB_INSTANCE_ID"
   else
-    echo "   - RDS ya existe: $DB_INSTANCE_ID (no recreo)"
+    ok "RDS reusado: $DB_INSTANCE_ID"
   fi
 
-  echo "   - Esperando a que RDS esté disponible (puede tardar)..."
-  aws rds wait db-instance-available --region "$REGION" --db-instance-identifier "$DB_INSTANCE_ID"
+  log "Esperando RDS disponible..."
+  awsq rds wait db-instance-available --db-instance-identifier "$DB_INSTANCE_ID"
 
-  DB_ENDPOINT="$(aws rds describe-db-instances --region "$REGION" --db-instance-identifier "$DB_INSTANCE_ID" \
+  DB_ENDPOINT="$(awsq rds describe-db-instances --db-instance-identifier "$DB_INSTANCE_ID" \
     --query "DBInstances[0].Endpoint.Address" --output text)"
+  ok "RDS Endpoint: $DB_ENDPOINT"
 
-  echo "✅ RDS Endpoint: $DB_ENDPOINT"
+  state_set DB_ENDPOINT "$DB_ENDPOINT"
+  step_done 8
 fi
 
-# -------------------------
-# 10) ALB + Target Group + Listener (solo Gateway)
-# -------------------------
-echo "==> 10) Creando ALB + Target Group (solo Gateway)..."
-
-TG_GW_ARN="$(aws elbv2 create-target-group --name "${PROJECT}-tg-gateway" \
-  --protocol HTTP --port "$PORT_GATEWAY" --vpc-id "$VPC_ID" --target-type ip \
-  --health-check-protocol HTTP --health-check-path "$HEALTH_PATH_GATEWAY" \
-  --region "$REGION" | jq -r '.TargetGroups[0].TargetGroupArn')"
-
-ALB_ARN="$(aws elbv2 create-load-balancer --name "${PROJECT}-alb" --type application --scheme internet-facing \
-  --subnets "$PUB1_ID" "$PUB2_ID" --security-groups "$SG_ALB_ID" --region "$REGION" \
-  | jq -r '.LoadBalancers[0].LoadBalancerArn')"
-
-ALB_DNS="$(aws elbv2 describe-load-balancers --load-balancer-arns "$ALB_ARN" --region "$REGION" \
-  | jq -r '.LoadBalancers[0].DNSName')"
-echo "ALB DNS: $ALB_DNS"
-
-LISTENER_ARN="$(aws elbv2 create-listener --load-balancer-arn "$ALB_ARN" --protocol HTTP --port 80 \
-  --default-actions "Type=forward,TargetGroupArn=$TG_GW_ARN" \
-  --region "$REGION" | jq -r '.Listeners[0].ListenerArn')"
+DB_ENDPOINT="$(state_get DB_ENDPOINT 2>/dev/null || echo "")"
 
 # -------------------------
-# 11) Task Definitions (7)
+# STEP 9) ALB + Target Group + Listener (solo Gateway)
 # -------------------------
-echo "==> 11) Registrando Task Definitions..."
+if ! is_step_done 9; then
+  log "9) ALB + TargetGroup..."
 
-NETWORK_MODE="awsvpc"
+  VPC_ID="$(state_get VPC_ID)"
+  PUB1_ID="$(state_get PUB1_ID)"
+  PUB2_ID="$(state_get PUB2_ID)"
+  SG_ALB_ID="$(state_get SG_ALB_ID)"
 
-register_task_def () {
-  local family="$1"
-  local image="$2"
-  local port="$3"
-  local log_group="$4"
-  local cname="$5"
-  local cpu="$6"
-  local mem="$7"
-  local env_json="$8"
+  TG_GW_ARN="$(state_get TG_GW_ARN)"
+  [[ -z "$TG_GW_ARN" ]] && TG_GW_ARN="$(get_tg_arn)"
+  if [[ -z "$TG_GW_ARN" ]]; then
+    TG_GW_ARN="$(awsq elbv2 create-target-group --name "$TG_GW_NAME" \
+      --protocol HTTP --port "$PORT_GATEWAY" --vpc-id "$VPC_ID" --target-type ip \
+      --health-check-protocol HTTP --health-check-path "$HEALTH_PATH_GATEWAY" \
+      | jq -r '.TargetGroups[0].TargetGroupArn')"
+    ok "TargetGroup creado: $TG_GW_ARN"
+  else
+    ok "TargetGroup reusado: $TG_GW_ARN"
+  fi
+  state_set TG_GW_ARN "$TG_GW_ARN"
 
-  aws ecs register-task-definition --family "$family" --network-mode "$NETWORK_MODE" \
-    --requires-compatibilities FARGATE --cpu "$cpu" --memory "$mem" \
-    --execution-role-arn "$ROLE_ARN" --region "$REGION" \
-    --container-definitions "[
-      {
-        \"name\": \"$cname\",
-        \"image\": \"$image\",
-        \"essential\": true,
-        \"portMappings\": [{\"containerPort\": $port, \"protocol\": \"tcp\"}],
-        \"environment\": $env_json,
-        \"logConfiguration\": {
-          \"logDriver\": \"awslogs\",
-          \"options\": {
-            \"awslogs-group\": \"$log_group\",
-            \"awslogs-region\": \"$REGION\",
-            \"awslogs-stream-prefix\": \"ecs\"
+  ALB_ARN="$(state_get ALB_ARN)"
+  [[ -z "$ALB_ARN" ]] && ALB_ARN="$(get_alb_arn)"
+  if [[ -z "$ALB_ARN" ]]; then
+    ALB_ARN="$(awsq elbv2 create-load-balancer --name "$ALB_NAME" \
+      --type application --scheme internet-facing \
+      --subnets "$PUB1_ID" "$PUB2_ID" --security-groups "$SG_ALB_ID" \
+      | jq -r '.LoadBalancers[0].LoadBalancerArn')"
+    ok "ALB creado: $ALB_ARN"
+  else
+    ok "ALB reusado: $ALB_ARN"
+  fi
+  state_set ALB_ARN "$ALB_ARN"
+
+  ALB_DNS="$(get_alb_dns "$ALB_ARN")"
+  state_set ALB_DNS "$ALB_DNS"
+  ok "ALB DNS: $ALB_DNS"
+
+  LISTENER_ARN="$(state_get LISTENER_ARN)"
+  [[ -z "$LISTENER_ARN" ]] && LISTENER_ARN="$(get_listener_arn_80 "$ALB_ARN")"
+  if [[ -z "$LISTENER_ARN" ]]; then
+    LISTENER_ARN="$(awsq elbv2 create-listener --load-balancer-arn "$ALB_ARN" \
+      --protocol HTTP --port 80 \
+      --default-actions "Type=forward,TargetGroupArn=$TG_GW_ARN" \
+      | jq -r '.Listeners[0].ListenerArn')"
+    ok "Listener creado: $LISTENER_ARN"
+  else
+    awsq elbv2 modify-listener --listener-arn "$LISTENER_ARN" \
+      --default-actions "Type=forward,TargetGroupArn=$TG_GW_ARN" >/dev/null 2>&1 || true
+    ok "Listener reusado: $LISTENER_ARN"
+  fi
+  state_set LISTENER_ARN "$LISTENER_ARN"
+
+  step_done 9
+fi
+
+TG_GW_ARN="$(state_get TG_GW_ARN)"
+ALB_DNS="$(state_get ALB_DNS)"
+
+# -------------------------
+# STEP 10) Task Definitions (env hardcoded) — FIX Git Bash
+# -------------------------
+if ! is_step_done 10; then
+  log "10) Registrando Task Definitions..."
+
+  NETWORK_MODE="awsvpc"
+
+  # ---- Merge JSON arrays sin /tmp ni process substitution ----
+  merge_env() {
+    local a="${1:-[]}"
+    local b="${2:-[]}"
+
+    [[ -z "${a//[[:space:]]/}" ]] && a="[]"
+    [[ -z "${b//[[:space:]]/}" ]] && b="[]"
+
+    jq -cn --argjson A "$a" --argjson B "$b" '$A + $B'
+  }
+
+  register_task_def () {
+    local family="$1"
+    local image="$2"
+    local port="$3"
+    local log_group="$4"
+    local cname="$5"
+    local cpu="$6"
+    local mem="$7"
+    local env_json="$8"
+
+    # ---- Seguridad: environment SIEMPRE debe ser array ----
+    if ! echo "${env_json:-[]}" | jq -e 'type=="array"' >/dev/null 2>&1; then
+      env_json="[]"
+    fi
+
+    # Compactar JSON
+    env_json="$(echo "$env_json" | jq -c .)"
+
+    awsq ecs register-task-definition \
+      --family "$family" \
+      --network-mode "$NETWORK_MODE" \
+      --requires-compatibilities FARGATE \
+      --cpu "$cpu" \
+      --memory "$mem" \
+      --execution-role-arn "$ROLE_ARN" \
+      --container-definitions "[
+        {
+          \"name\": \"$cname\",
+          \"image\": \"$image\",
+          \"essential\": true,
+          \"portMappings\": [
+            {\"containerPort\": $port, \"protocol\": \"tcp\"}
+          ],
+          \"environment\": $env_json,
+          \"logConfiguration\": {
+            \"logDriver\": \"awslogs\",
+            \"options\": {
+              \"awslogs-group\": \"$log_group\",
+              \"awslogs-region\": \"$REGION\",
+              \"awslogs-stream-prefix\": \"ecs\"
+            }
           }
         }
-      }
-    ]" | jq -r '.taskDefinition.taskDefinitionArn'
-}
+      ]" \
+      | jq -r '.taskDefinition.taskDefinitionArn'
+  }
 
-# Env base para que NO dependas de tus variables custom
-ENV_CONFIG='[
-  {"name":"SPRING_CLOUD_CONFIG_SERVER_GIT_URI","value":"https://github.com/Raulcudris/microservices-fargate-demo.git"},
-  {"name":"SPRING_CLOUD_CONFIG_SERVER_GIT_DEFAULT_LABEL","value":"main"},
-  {"name":"SPRING_CLOUD_CONFIG_SERVER_GIT_SEARCH_PATHS","value":"config-data"},
-  {"name":"SPRING_CLOUD_CONFIG_SERVER_GIT_CLONE_ON_START","value":"true"}
-]'
+  # ---------------- ENVIRONMENTS ----------------
 
-# Clientes: apuntan a configservice + eureka internos
-ENV_CLIENT_BASE='[
-  {"name":"SPRING_CLOUD_CONFIG_URI","value":"http://configservice:8081"},
-  {"name":"EUREKA_CLIENT_SERVICEURL_DEFAULTZONE","value":"http://eurekaservice:8761/eureka/"}
-]'
+  ENV_CONFIG='[
+    {"name":"SPRING_CLOUD_CONFIG_SERVER_GIT_URI","value":"https://github.com/Raulcudris/microservices-fargate-demo.git"},
+    {"name":"SPRING_CLOUD_CONFIG_SERVER_GIT_DEFAULT_LABEL","value":"main"},
+    {"name":"SPRING_CLOUD_CONFIG_SERVER_GIT_SEARCH_PATHS","value":"config-data"},
+    {"name":"SPRING_CLOUD_CONFIG_SERVER_GIT_CLONE_ON_START","value":"true"}
+  ]'
 
-# MySQL env (si RDS existe, úsalo; si no, queda vacío y tú lo ajustas)
-MYSQL_ENV="[]"
-if [[ -n "$DB_ENDPOINT" ]]; then
-  MYSQL_ENV="$(jq -nc --arg host "$DB_ENDPOINT" --arg db "$DB_NAME" --arg user "$DB_USER" --arg pass "$DB_PASS" \
-    '[{"name":"DB_HOST","value":$host},{"name":"DB_NAME","value":$db},{"name":"DB_USER","value":$user},{"name":"DB_PASS","value":$pass}]')"
+  ENV_CLIENT_BASE='[
+    {"name":"SPRING_CLOUD_CONFIG_URI","value":"http://configservice:8081"},
+    {"name":"EUREKA_CLIENT_SERVICEURL_DEFAULTZONE","value":"http://eurekaservice:8761/eureka/"}
+  ]'
+
+  MYSQL_ENV="[]"
+  if [[ -n "${DB_ENDPOINT:-}" ]]; then
+    MYSQL_ENV="$(jq -nc \
+      --arg host "$DB_ENDPOINT" \
+      --arg db "$DB_NAME" \
+      --arg user "$DB_USER" \
+      --arg pass "$DB_PASS" \
+      '[{"name":"DB_HOST","value":$host},
+        {"name":"DB_NAME","value":$db},
+        {"name":"DB_USER","value":$user},
+        {"name":"DB_PASS","value":$pass}]')"
+  fi
+
+  JWT_ENV="$(jq -nc --arg jwt "$JWT_SECRET" \
+    '[{"name":"JWT_SECRET","value":$jwt}]')"
+
+  # ---- Merge environments ----
+  ENV_PRODUCTS="$(merge_env "$ENV_CLIENT_BASE" "$MYSQL_ENV")"
+  ENV_ORDERS="$(merge_env "$ENV_CLIENT_BASE" "$MYSQL_ENV")"
+  ENV_PAY="$(merge_env "$ENV_CLIENT_BASE" "$MYSQL_ENV")"
+
+  ENV_USERS_BASE="$(merge_env "$ENV_CLIENT_BASE" "$MYSQL_ENV")"
+  ENV_USERS="$(merge_env "$ENV_USERS_BASE" "$JWT_ENV")"
+
+  # ---------------- REGISTER TASKS ----------------
+
+  TD_CONFIG_ARN="$(register_task_def \
+    "${PROJECT}-td-config" \
+    "$ECR/$REPO_CONFIG:$TAG" \
+    "$PORT_CONFIG" \
+    "$LG_CONFIG" \
+    "configservice" \
+    "$CPU_SMALL" \
+    "$MEM_SMALL" \
+    "$ENV_CONFIG")"
+
+  TD_EUREKA_ARN="$(register_task_def \
+    "${PROJECT}-td-eureka" \
+    "$ECR/$REPO_EUREKA:$TAG" \
+    "$PORT_EUREKA" \
+    "$LG_EUREKA" \
+    "eurekaservice" \
+    "$CPU_SMALL" \
+    "$MEM_SMALL" \
+    "$ENV_CLIENT_BASE")"
+
+  TD_GATEWAY_ARN="$(register_task_def \
+    "${PROJECT}-td-gateway" \
+    "$ECR/$REPO_GATEWAY:$TAG" \
+    "$PORT_GATEWAY" \
+    "$LG_GATEWAY" \
+    "gatewayservice" \
+    "$CPU_MED" \
+    "$MEM_MED" \
+    "$ENV_CLIENT_BASE")"
+
+  TD_PRODUCTS_ARN="$(register_task_def \
+    "${PROJECT}-td-products" \
+    "$ECR/$REPO_PRODUCTS:$TAG" \
+    "$PORT_PRODUCTS" \
+    "$LG_PRODUCTS" \
+    "productservice" \
+    "$CPU_SMALL" \
+    "$MEM_SMALL" \
+    "$ENV_PRODUCTS")"
+
+  TD_ORDERS_ARN="$(register_task_def \
+    "${PROJECT}-td-orders" \
+    "$ECR/$REPO_ORDERS:$TAG" \
+    "$PORT_ORDERS" \
+    "$LG_ORDERS" \
+    "orderservice" \
+    "$CPU_SMALL" \
+    "$MEM_SMALL" \
+    "$ENV_ORDERS")"
+
+  TD_PAY_ARN="$(register_task_def \
+    "${PROJECT}-td-pay" \
+    "$ECR/$REPO_PAY:$TAG" \
+    "$PORT_PAY" \
+    "$LG_PAY" \
+    "paymentservice" \
+    "$CPU_SMALL" \
+    "$MEM_SMALL" \
+    "$ENV_PAY")"
+
+  TD_USERS_ARN="$(register_task_def \
+    "${PROJECT}-td-users" \
+    "$ECR/$REPO_USERS:$TAG" \
+    "$PORT_USERS" \
+    "$LG_USERS" \
+    "userservice" \
+    "$CPU_SMALL" \
+    "$MEM_SMALL" \
+    "$ENV_USERS")"
+
+  state_set TD_CONFIG_ARN "$TD_CONFIG_ARN"
+  state_set TD_EUREKA_ARN "$TD_EUREKA_ARN"
+  state_set TD_GATEWAY_ARN "$TD_GATEWAY_ARN"
+  state_set TD_PRODUCTS_ARN "$TD_PRODUCTS_ARN"
+  state_set TD_ORDERS_ARN "$TD_ORDERS_ARN"
+  state_set TD_PAY_ARN "$TD_PAY_ARN"
+  state_set TD_USERS_ARN "$TD_USERS_ARN"
+
+  step_done 10
 fi
 
-# Users JWT env
-JWT_ENV="$(jq -nc --arg jwt "$JWT_SECRET" '[{"name":"JWT_SECRET","value":$jwt}]')"
-
-# Merge env arrays helper via jq at runtime
-merge_env () {
-  jq -s 'add' <(echo "$1") <(echo "$2")
-}
-
-TD_CONFIG_ARN="$(register_task_def "${PROJECT}-td-config"   "$ECR/$REPO_CONFIG:$TAG"   "$PORT_CONFIG"   "$LG_CONFIG"   "configservice"  "$CPU_SMALL" "$MEM_SMALL" "$ENV_CONFIG")"
-TD_EUREKA_ARN="$(register_task_def "${PROJECT}-td-eureka"   "$ECR/$REPO_EUREKA:$TAG"   "$PORT_EUREKA"   "$LG_EUREKA"   "eurekaservice"  "$CPU_SMALL" "$MEM_SMALL" "$ENV_CLIENT_BASE")"
-TD_GATEWAY_ARN="$(register_task_def "${PROJECT}-td-gateway" "$ECR/$REPO_GATEWAY:$TAG"  "$PORT_GATEWAY"  "$LG_GATEWAY"  "gatewayservice" "$CPU_MED"   "$MEM_MED"   "$ENV_CLIENT_BASE")"
-
-ENV_PRODUCTS="$(merge_env "$ENV_CLIENT_BASE" "$MYSQL_ENV")"
-ENV_ORDERS="$(merge_env "$ENV_CLIENT_BASE" "$MYSQL_ENV")"
-ENV_PAY="$(merge_env "$ENV_CLIENT_BASE" "$MYSQL_ENV")"
-ENV_USERS="$(merge_env "$(merge_env "$ENV_CLIENT_BASE" "$MYSQL_ENV")" "$JWT_ENV")"
-
-TD_PRODUCTS_ARN="$(register_task_def "${PROJECT}-td-products" "$ECR/$REPO_PRODUCTS:$TAG" "$PORT_PRODUCTS" "$LG_PRODUCTS" "productservice" "$CPU_SMALL" "$MEM_SMALL" "$ENV_PRODUCTS")"
-TD_ORDERS_ARN="$(register_task_def "${PROJECT}-td-orders"   "$ECR/$REPO_ORDERS:$TAG"   "$PORT_ORDERS"   "$LG_ORDERS"   "orderservice"  "$CPU_SMALL" "$MEM_SMALL" "$ENV_ORDERS")"
-TD_PAY_ARN="$(register_task_def "${PROJECT}-td-pay"         "$ECR/$REPO_PAY:$TAG"      "$PORT_PAY"      "$LG_PAY"      "paymentservice" "$CPU_SMALL" "$MEM_SMALL" "$ENV_PAY")"
-TD_USERS_ARN="$(register_task_def "${PROJECT}-td-users"     "$ECR/$REPO_USERS:$TAG"    "$PORT_USERS"    "$LG_USERS"    "userservice"    "$CPU_SMALL" "$MEM_SMALL" "$ENV_USERS")"
+TD_CONFIG_ARN="$(state_get TD_CONFIG_ARN)"
+TD_EUREKA_ARN="$(state_get TD_EUREKA_ARN)"
+TD_GATEWAY_ARN="$(state_get TD_GATEWAY_ARN)"
+TD_PRODUCTS_ARN="$(state_get TD_PRODUCTS_ARN)"
+TD_ORDERS_ARN="$(state_get TD_ORDERS_ARN)"
+TD_PAY_ARN="$(state_get TD_PAY_ARN)"
+TD_USERS_ARN="$(state_get TD_USERS_ARN)"
 
 # -------------------------
-# 12) ECS Services + Cloud Map + ALB attach (solo Gateway)
+# STEP 11) ECS Services + ALB attach (Gateway)
 # -------------------------
-echo "==> 12) Creando ECS Services..."
+if ! is_step_done 11; then
+  log "11) ECS Services (create/update)..."
 
-# Network confs
-NETCONF_PUBLIC="awsvpcConfiguration={subnets=[$PUB1_ID,$PUB2_ID],securityGroups=[$SG_CONFIG_PUBLIC_ID],assignPublicIp=ENABLED}"
-NETCONF_PRIVATE="awsvpcConfiguration={subnets=[$PRI1_ID,$PRI2_ID],securityGroups=[$SG_ECS_PRIVATE_ID],assignPublicIp=DISABLED}"
+  PUB1_ID="$(state_get PUB1_ID)"
+  PUB2_ID="$(state_get PUB2_ID)"
+  PRI1_ID="$(state_get PRI1_ID)"
+  PRI2_ID="$(state_get PRI2_ID)"
+  SG_CONFIG_ID="$(state_get SG_CONFIG_ID)"
+  SG_ECS_PRIVATE_ID="$(state_get SG_ECS_PRIVATE_ID)"
 
-create_service_sd () {
-  local svc="$1"
-  local td="$2"
-  local net="$3"
-  local sd_id="$4"
-  aws ecs create-service --cluster "$CLUSTER_NAME" --service-name "$svc" \
-    --task-definition "$td" --desired-count 1 --launch-type FARGATE \
-    --network-configuration "$net" \
-    --service-registries "registryArn=arn:aws:servicediscovery:${REGION}:${ACCOUNT_ID}:service/${sd_id}" \
-    --health-check-grace-period-seconds 120 \
-    --region "$REGION" >/dev/null
-}
+  NETCONF_CONFIG="awsvpcConfiguration={subnets=[$PUB1_ID,$PUB2_ID],securityGroups=[$SG_CONFIG_ID],assignPublicIp=ENABLED}"
+  NETCONF_PRIVATE="awsvpcConfiguration={subnets=[$PRI1_ID,$PRI2_ID],securityGroups=[$SG_ECS_PRIVATE_ID],assignPublicIp=DISABLED}"
 
-create_service_sd_lb () {
-  local svc="$1"
-  local td="$2"
-  local net="$3"
-  local sd_id="$4"
-  local tg="$5"
-  local cname="$6"
-  local cport="$7"
-  aws ecs create-service --cluster "$CLUSTER_NAME" --service-name "$svc" \
-    --task-definition "$td" --desired-count 1 --launch-type FARGATE \
-    --network-configuration "$net" \
-    --service-registries "registryArn=arn:aws:servicediscovery:${REGION}:${ACCOUNT_ID}:service/${sd_id}" \
-    --load-balancers "targetGroupArn=$tg,containerName=$cname,containerPort=$cport" \
-    --health-check-grace-period-seconds 180 \
-    --region "$REGION" >/dev/null
-}
+  create_or_update_service_sd "$SVC_CONFIG"   "$TD_CONFIG_ARN"   "$NETCONF_CONFIG"  "$SD_CONFIG_ID"
+  create_or_update_service_sd "$SVC_EUREKA"   "$TD_EUREKA_ARN"   "$NETCONF_PRIVATE" "$SD_EUREKA_ID"
+  create_or_update_service_sd_lb "$SVC_GATEWAY" "$TD_GATEWAY_ARN" "$NETCONF_PRIVATE" "$SD_GATEWAY_ID" \
+    "$TG_GW_ARN" "gatewayservice" "$PORT_GATEWAY"
+  create_or_update_service_sd "$SVC_PRODUCTS" "$TD_PRODUCTS_ARN" "$NETCONF_PRIVATE" "$SD_PRODUCTS_ID"
+  create_or_update_service_sd "$SVC_ORDERS"   "$TD_ORDERS_ARN"   "$NETCONF_PRIVATE" "$SD_ORDERS_ID"
+  create_or_update_service_sd "$SVC_PAY"      "$TD_PAY_ARN"      "$NETCONF_PRIVATE" "$SD_PAY_ID"
+  create_or_update_service_sd "$SVC_USERS"    "$TD_USERS_ARN"    "$NETCONF_PRIVATE" "$SD_USERS_ID"
 
-# Orden recomendado (para reducir fallos de arranque)
-create_service_sd "$SVC_CONFIG"   "$TD_CONFIG_ARN"   "$NETCONF_PUBLIC"  "$SD_CONFIG_ID"
-create_service_sd "$SVC_EUREKA"   "$TD_EUREKA_ARN"   "$NETCONF_PRIVATE" "$SD_EUREKA_ID"
-create_service_sd_lb "$SVC_GATEWAY" "$TD_GATEWAY_ARN" "$NETCONF_PRIVATE" "$SD_GATEWAY_ID" "$TG_GW_ARN" "gatewayservice" "$PORT_GATEWAY"
-create_service_sd "$SVC_PRODUCTS" "$TD_PRODUCTS_ARN" "$NETCONF_PRIVATE" "$SD_PRODUCTS_ID"
-create_service_sd "$SVC_ORDERS"   "$TD_ORDERS_ARN"   "$NETCONF_PRIVATE" "$SD_ORDERS_ID"
-create_service_sd "$SVC_PAY"      "$TD_PAY_ARN"      "$NETCONF_PRIVATE" "$SD_PAY_ID"
-create_service_sd "$SVC_USERS"    "$TD_USERS_ARN"    "$NETCONF_PRIVATE" "$SD_USERS_ID"
+  step_done 11
+fi
 
 echo ""
-echo "✅ Deploy completado."
+ok "Deploy completado (resumible/idempotente) — sin NAT, sin SSM."
 echo "ALB DNS: http://${ALB_DNS}"
-echo ""
-echo "Pruebas (vía Gateway):"
-echo "  - http://${ALB_DNS}/products/..."
-echo "  - http://${ALB_DNS}/orders/..."
-echo "  - http://${ALB_DNS}/pay/..."
-echo "  - http://${ALB_DNS}/users/login"
-echo ""
-echo "Health Gateway:"
-echo "  - http://${ALB_DNS}${HEALTH_PATH_GATEWAY}"
-echo ""
-if [[ -n "$DB_ENDPOINT" ]]; then
+echo "Health:  http://${ALB_DNS}${HEALTH_PATH_GATEWAY}"
+if [[ -n "${DB_ENDPOINT:-}" ]]; then
   echo "RDS endpoint (privado): ${DB_ENDPOINT}"
 fi
+echo "Estado: ${STATE_FILE}"
