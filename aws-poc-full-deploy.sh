@@ -958,13 +958,23 @@ if ! is_step_done 10; then
   }
 
   ENV_CONFIG='[
+    {"name":"SERVER_PORT","value":"8081"},
     {"name":"SPRING_CLOUD_CONFIG_SERVER_GIT_URI","value":"https://github.com/Raulcudris/microservices-fargate-demo.git"},
     {"name":"SPRING_CLOUD_CONFIG_SERVER_GIT_DEFAULT_LABEL","value":"main"},
     {"name":"SPRING_CLOUD_CONFIG_SERVER_GIT_SEARCH_PATHS","value":"config-data"},
     {"name":"SPRING_CLOUD_CONFIG_SERVER_GIT_CLONE_ON_START","value":"true"}
   ]'
-
   ENV_CLIENT_BASE="$(jq -nc --arg ns "$NAMESPACE_NAME" '[
+    {"name":"SPRING_CLOUD_CONFIG_URI","value":("http://configservice."+ $ns +":8081")},
+    {"name":"SPRING_CLOUD_CONFIG_FAIL_FAST","value":"false"},
+    {"name":"SPRING_CLOUD_CONFIG_RETRY_MAX_ATTEMPTS","value":"20"},
+    {"name":"SPRING_CLOUD_CONFIG_RETRY_INITIAL_INTERVAL","value":"2000"},
+    {"name":"SPRING_CLOUD_CONFIG_RETRY_MULTIPLIER","value":"1.5"},
+    {"name":"SPRING_CLOUD_CONFIG_RETRY_MAX_INTERVAL","value":"10000"},
+    {"name":"EUREKA_URL","value":("http://eurekaservice."+ $ns +":8761")}
+  ]')"
+
+  ENV_EUREKA="$(jq -nc --arg ns "$NAMESPACE_NAME" '[
     {"name":"SPRING_CLOUD_CONFIG_URI","value":("http://configservice."+ $ns +":8081")},
     {"name":"SPRING_CLOUD_CONFIG_FAIL_FAST","value":"false"},
     {"name":"SPRING_CLOUD_CONFIG_RETRY_MAX_ATTEMPTS","value":"20"},
@@ -974,16 +984,6 @@ if ! is_step_done 10; then
     {"name":"EUREKA_URL","value":("http://eurekaservice."+ $ns +":8761")},
     {"name":"EUREKA_CLIENT_SERVICEURL_DEFAULTZONE","value":("http://eurekaservice."+ $ns +":8761/eureka/")}
   ]')"
-
-  ENV_EUREKA="$(jq -nc --arg ns "$NAMESPACE_NAME" '[
-    {"name":"SPRING_CLOUD_CONFIG_URI","value":("http://configservice."+ $ns +":8081")},
-    {"name":"SPRING_CLOUD_CONFIG_FAIL_FAST","value":"false"},
-    {"name":"SPRING_CLOUD_CONFIG_RETRY_MAX_ATTEMPTS","value":"20"},
-    {"name":"SPRING_CLOUD_CONFIG_RETRY_INITIAL_INTERVAL","value":"2000"},
-    {"name":"SPRING_CLOUD_CONFIG_RETRY_MULTIPLIER","value":"1.5"},
-    {"name":"SPRING_CLOUD_CONFIG_RETRY_MAX_INTERVAL","value":"10000"}
-  ]')"
-
   MYSQL_ENV="[]"
   if [[ -n "${DB_ENDPOINT:-}" ]]; then
     MYSQL_ENV="$(jq -nc \
