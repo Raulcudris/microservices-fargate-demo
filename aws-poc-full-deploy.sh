@@ -971,7 +971,7 @@ if ! is_step_done 10; then
     {"name":"SPRING_CLOUD_CONFIG_RETRY_INITIAL_INTERVAL","value":"2000"},
     {"name":"SPRING_CLOUD_CONFIG_RETRY_MULTIPLIER","value":"1.5"},
     {"name":"SPRING_CLOUD_CONFIG_RETRY_MAX_INTERVAL","value":"10000"},
-    {"name":"EUREKA_CLIENT_SERVICEURL_DEFAULTZONE","value":("http://eurekaservice."+ $ns +":8761/eureka/")}
+    {"name":"EUREKA_URL","value":("http://eurekaservice."+ $ns +":8761")}
   ]')"
 
   MYSQL_ENV="[]"
