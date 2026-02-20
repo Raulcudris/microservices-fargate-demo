@@ -11,14 +11,13 @@ CLUSTER_NAME="${PROJECT}-cluster"
 ROLE_NAME="${PROJECT}-ecsTaskExecutionRole"
 
 # ⚠️ IMPORTANT: Estos nombres deben coincidir con tu deploy ACTUAL
-# (en tu deploy resumible los pusiste hardcodeados así)
 ALB_NAME="msfd-alb"
 TG_GW_NAME="msfd-tg-gw"
 
 # Security groups (según tu deploy actual)
 SG_ALB_NAME="${PROJECT}-sg-alb"
 SG_ECS_PRIVATE_NAME="${PROJECT}-sg-ecs-private"
-SG_CONFIG_NAME="${PROJECT}-sg-config-egress"   # ✅ antes era sg-config-public
+SG_CONFIG_NAME="${PROJECT}-sg-config-egress"
 SG_RDS_NAME="${PROJECT}-sg-rds"
 SG_VPCE_NAME="${PROJECT}-sg-vpce"
 
@@ -123,6 +122,39 @@ delete_taskdef_family() {
   else
     echo " - No task definitions active for: $family (ok)"
   fi
+}
+
+# ---- NAT helpers (NEW) ----
+list_nat_gateways_in_vpc() {
+  local vpc_id="$1"
+  awsq ec2 describe-nat-gateways \
+    --filter "Name=vpc-id,Values=${vpc_id}" \
+    --query "NatGateways[?State!='deleted'].NatGatewayId" \
+    --output text 2>/dev/null || true
+}
+
+nat_eip_allocation_ids() {
+  local nat_id="$1"
+  awsq ec2 describe-nat-gateways \
+    --nat-gateway-ids "$nat_id" \
+    --query "NatGateways[0].NatGatewayAddresses[].AllocationId" \
+    --output text 2>/dev/null || true
+}
+
+wait_nat_deleted() {
+  local nat_id="$1"
+  echo " - Waiting NAT deleted: $nat_id"
+  for i in {1..60}; do
+    state="$(awsq ec2 describe-nat-gateways --nat-gateway-ids "$nat_id" \
+      --query "NatGateways[0].State" --output text 2>/dev/null || true)"
+    if [[ "$state" == "deleted" || "$state" == "None" || -z "$state" ]]; then
+      echo "   * NAT deleted: $nat_id"
+      return 0
+    fi
+    echo "   * NAT state=$state (retry $i/60)"
+    sleep 10
+  done
+  echo "⚠️  Timeout esperando NAT deleted (puede seguir en borrado): $nat_id"
 }
 
 # =========================
@@ -246,7 +278,6 @@ NS_ID="$(awsq servicediscovery list-namespaces \
 if [[ -n "${NS_ID}" ]]; then
   echo " - Namespace encontrado: $NAMESPACE_NAME ($NS_ID)"
 
-  # 5.1) Borrar services asociados (si existen)
   SD_SERVICES="$(awsq servicediscovery list-services \
     --query "Services[?NamespaceId=='${NS_ID}'].Id" --output text 2>/dev/null || true)"
 
@@ -259,7 +290,6 @@ if [[ -n "${NS_ID}" ]]; then
     echo " - No hay servicios asociados (ok)"
   fi
 
-  # 5.2) Esperar hasta que realmente desaparezcan los services del namespace
   echo " - Waiting services deletion (Cloud Map async)..."
   for i in {1..60}; do
     SD_LEFT="$(awsq servicediscovery list-services \
@@ -271,14 +301,12 @@ if [[ -n "${NS_ID}" ]]; then
     fi
 
     echo "   * Aún quedan services: ${SD_LEFT} (intentando de nuevo...)"
-    # Reintenta borrado por si alguno quedó “pegado”
     for sid in $SD_LEFT; do
       awsq servicediscovery delete-service --id "$sid" >/dev/null 2>&1 || true
     done
     sleep 5
   done
 
-  # 5.3) Borrar namespace con retry (por si AWS tarda un poco más)
   echo " - Deleting namespace: $NAMESPACE_NAME ($NS_ID)"
   for i in {1..20}; do
     if awsq servicediscovery delete-namespace --id "$NS_ID" >/dev/null 2>&1; then
@@ -342,6 +370,34 @@ echo "==> 9) Eliminando VPC y networking..."
 VPC_ID="$(get_vpc_id)"
 if [[ -n "${VPC_ID}" ]]; then
   echo " - VPC: $VPC_ID"
+
+  # -------------------------
+  # 9.0) NAT Gateways (delete) + Release EIPs  ✅ NEW
+  # -------------------------
+  echo "==> 9.0) Eliminando NAT Gateways (si existen)..."
+
+  NAT_IDS="$(list_nat_gateways_in_vpc "$VPC_ID")"
+  if [[ -n "${NAT_IDS// }" ]]; then
+    for nat in $NAT_IDS; do
+      echo " - Deleting NAT Gateway: $nat"
+
+      # Captura EIP allocation ids antes de borrar NAT
+      ALLOCS="$(nat_eip_allocation_ids "$nat")"
+
+      awsq ec2 delete-nat-gateway --nat-gateway-id "$nat" >/dev/null 2>&1 || true
+      wait_nat_deleted "$nat"
+
+      # Liberar EIPs asociados
+      if [[ -n "${ALLOCS// }" ]]; then
+        for alloc in $ALLOCS; do
+          echo " - Releasing EIP AllocationId: $alloc"
+          awsq ec2 release-address --allocation-id "$alloc" >/dev/null 2>&1 || true
+        done
+      fi
+    done
+  else
+    echo " - No hay NAT Gateways (ok)"
+  fi
 
   SG_ALB_ID="$(get_sg_id_by_name "$SG_ALB_NAME" "$VPC_ID")"
   SG_ECS_PRIVATE_ID="$(get_sg_id_by_name "$SG_ECS_PRIVATE_NAME" "$VPC_ID")"

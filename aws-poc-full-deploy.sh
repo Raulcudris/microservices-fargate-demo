@@ -501,7 +501,53 @@ if ! is_step_done 1; then
 
   step_done 1
 fi
+# -------------------------
+# NAT Gateway (para subnets privadas)
+# -------------------------
+if ! is_step_done "NAT"; then
+  log "NAT) Creando NAT Gateway para salida a Internet desde subnets privadas..."
 
+  VPC_ID="$(state_get VPC_ID)"
+  PUB1_ID="$(state_get PUB1_ID)"
+  RTB_PRI_ID="$(state_get RTB_PRI_ID)"
+
+  # 1) Elastic IP para NAT
+  NAT_EIP_ALLOC_ID="$(state_get NAT_EIP_ALLOC_ID)"
+  if [[ -z "${NAT_EIP_ALLOC_ID:-}" || "$NAT_EIP_ALLOC_ID" == "None" ]]; then
+    NAT_EIP_ALLOC_ID="$(awsq ec2 allocate-address --domain vpc --query AllocationId --output text)"
+    state_set NAT_EIP_ALLOC_ID "$NAT_EIP_ALLOC_ID"
+    ok "EIP asignada: $NAT_EIP_ALLOC_ID"
+  else
+    ok "EIP reusada: $NAT_EIP_ALLOC_ID"
+  fi
+
+  # 2) NAT Gateway en subnet pública (recomendado en PUB1)
+  NAT_GW_ID="$(state_get NAT_GW_ID)"
+  if [[ -z "${NAT_GW_ID:-}" || "$NAT_GW_ID" == "None" ]]; then
+    NAT_GW_ID="$(awsq ec2 create-nat-gateway \
+      --subnet-id "$PUB1_ID" \
+      --allocation-id "$NAT_EIP_ALLOC_ID" \
+      --query "NatGateway.NatGatewayId" --output text)"
+    state_set NAT_GW_ID "$NAT_GW_ID"
+    ok "NAT Gateway creado: $NAT_GW_ID"
+  else
+    ok "NAT Gateway reusado: $NAT_GW_ID"
+  fi
+  # 3) Esperar NAT AVAILABLE
+  log "Esperando NAT Gateway available..."
+  awsq ec2 wait nat-gateway-available --nat-gateway-ids "$NAT_GW_ID"
+  ok "NAT Gateway listo: $NAT_GW_ID"
+
+  # 4) Ruta default 0.0.0.0/0 en RT privada hacia NAT
+  # (si ya existe, ignora)
+  awsq ec2 create-route \
+    --route-table-id "$RTB_PRI_ID" \
+    --destination-cidr-block "0.0.0.0/0" \
+    --nat-gateway-id "$NAT_GW_ID" >/dev/null 2>&1 || true
+
+  ok "Ruta privada -> NAT configurada en: $RTB_PRI_ID"
+  step_done "NAT"
+fi
 # -------------------------
 # STEP 2) Security Groups + VPC Endpoints (sin NAT)
 # -------------------------
@@ -918,10 +964,10 @@ if ! is_step_done 10; then
     {"name":"SPRING_CLOUD_CONFIG_SERVER_GIT_CLONE_ON_START","value":"true"}
   ]'
 
-  ENV_CLIENT_BASE='[
-    {"name":"SPRING_CLOUD_CONFIG_URI","value":"http://configservice:8081"},
-    {"name":"EUREKA_CLIENT_SERVICEURL_DEFAULTZONE","value":"http://eurekaservice:8761/eureka/"}
-  ]'
+ENV_CLIENT_BASE="$(jq -nc --arg ns "$NAMESPACE_NAME" '[
+  {"name":"SPRING_CLOUD_CONFIG_URI","value":("http://configservice."+ $ns +":8081")},
+  {"name":"EUREKA_CLIENT_SERVICEURL_DEFAULTZONE","value":("http://eurekaservice."+ $ns +":8761/eureka/")}
+]')"
 
   MYSQL_ENV="[]"
   if [[ -n "${DB_ENDPOINT:-}" ]]; then
