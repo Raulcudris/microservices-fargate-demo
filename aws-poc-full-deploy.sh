@@ -977,7 +977,10 @@ if ! is_step_done 10; then
   ]')"
 
   ENV_EUREKA="$(jq -nc --arg ns "$NAMESPACE_NAME" '[
+    {"name":"SERVER_PORT","value":"8761"},
+
     {"name":"CONFIG_SERVICE_URL","value":("http://configservice."+ $ns +":8081")},
+    {"name":"SPRING_CLOUD_CONFIG_URI","value":("http://configservice."+ $ns +":8081")},
     {"name":"SPRING_CLOUD_CONFIG_FAIL_FAST","value":"false"},
     {"name":"SPRING_CLOUD_CONFIG_RETRY_MAX_ATTEMPTS","value":"20"},
     {"name":"SPRING_CLOUD_CONFIG_RETRY_INITIAL_INTERVAL","value":"2000"},

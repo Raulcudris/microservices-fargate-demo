@@ -45,10 +45,7 @@ eureka:
     fetch-registry: true
     register-with-eureka: true
     service-url:
-      # ✅ Recomendado: setear EUREKA_URL desde ECS:
-      #    EUREKA_URL=http://eurekaservice.microservices-fargate-demo.local:8761
-      # Si no existe, usa el FQDN de Cloud Map como fallback:
-      defaultZone: ${EUREKA_URL:http://eurekaservice.microservices-fargate-demo.local:8761}/eureka
+      defaultZone: ${EUREKA_CLIENT_SERVICEURL_DEFAULTZONE:http://eurekaservice.microservices-fargate-demo.local:8761/eureka/}
 
 management:
   endpoints:

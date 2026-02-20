@@ -33,7 +33,7 @@ eureka:
     fetch-registry: true
     register-with-eureka: true
     service-url:
-      defaultZone: ${EUREKA_URL:http://eurekaservice.microservices-fargate-demo.local:8761}/eureka
+      defaultZone: ${EUREKA_CLIENT_SERVICEURL_DEFAULTZONE:http://eurekaservice.microservices-fargate-demo.local:8761/eureka/}
 
 management:
   endpoints:
