@@ -964,10 +964,15 @@ if ! is_step_done 10; then
     {"name":"SPRING_CLOUD_CONFIG_SERVER_GIT_CLONE_ON_START","value":"true"}
   ]'
 
-ENV_CLIENT_BASE="$(jq -nc --arg ns "$NAMESPACE_NAME" '[
-  {"name":"SPRING_CLOUD_CONFIG_URI","value":("http://configservice."+ $ns +":8081")},
-  {"name":"EUREKA_CLIENT_SERVICEURL_DEFAULTZONE","value":("http://eurekaservice."+ $ns +":8761/eureka/")}
-]')"
+  ENV_CLIENT_BASE="$(jq -nc --arg ns "$NAMESPACE_NAME" '[
+    {"name":"SPRING_CLOUD_CONFIG_URI","value":("http://configservice."+ $ns +":8081")},
+    {"name":"SPRING_CLOUD_CONFIG_FAIL_FAST","value":"false"},
+    {"name":"SPRING_CLOUD_CONFIG_RETRY_MAX_ATTEMPTS","value":"20"},
+    {"name":"SPRING_CLOUD_CONFIG_RETRY_INITIAL_INTERVAL","value":"2000"},
+    {"name":"SPRING_CLOUD_CONFIG_RETRY_MULTIPLIER","value":"1.5"},
+    {"name":"SPRING_CLOUD_CONFIG_RETRY_MAX_INTERVAL","value":"10000"},
+    {"name":"EUREKA_CLIENT_SERVICEURL_DEFAULTZONE","value":("http://eurekaservice."+ $ns +":8761/eureka/")}
+  ]')"
 
   MYSQL_ENV="[]"
   if [[ -n "${DB_ENDPOINT:-}" ]]; then

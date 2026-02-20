@@ -38,11 +38,17 @@ spring:
             - Path=/users/**
 
 eureka:
+  instance:
+    prefer-ip-address: true
+    instance-id: ${spring.application.name}:${HOSTNAME:${random.value}}
   client:
     fetch-registry: true
     register-with-eureka: true
     service-url:
-      defaultZone: ${EUREKA_URL:http://eurekaservice:8761}/eureka
+      # ✅ Recomendado: setear EUREKA_URL desde ECS:
+      #    EUREKA_URL=http://eurekaservice.microservices-fargate-demo.local:8761
+      # Si no existe, usa el FQDN de Cloud Map como fallback:
+      defaultZone: ${EUREKA_URL:http://eurekaservice.microservices-fargate-demo.local:8761}/eureka
 
 management:
   endpoints:
