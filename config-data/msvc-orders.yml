@@ -6,12 +6,10 @@ spring:
     name: msvc-orders
 
   datasource:
-    # ✅ Defaults para que no se rompa si una env no llega por cualquier motivo
     url: jdbc:mysql://${DB_HOST:localhost}:${DB_PORT:3306}/${DB_NAME:ecommerce_myshop}?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
     username: ${DB_USER:admin}
-    # ✅ TU SCRIPT ENVÍA DB_PASS (no DB_PASSWORD)
     password: ${DB_PASS:}
-    driver-class-name: com.mysql.cj.jdbc.Driver
+    driver-class-name: com.mysql.cj.jdbc.Driver    driver-class-name: com.mysql.cj.jdbc.Driver
     hikari:
       initializationFailTimeout: 0
       connectionTimeout: 30000
