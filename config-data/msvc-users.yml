@@ -6,13 +6,12 @@ spring:
     name: msvc-users
 
   datasource:
-    url: jdbc:mysql://${DB_HOST}:${DB_PORT}/${DB_NAME}?useSSL=true&serverTimezone=UTC&allowPublicKeyRetrieval=true
-    username: ${DB_USER}
-    password: ${DB_PASSWORD}
+    url: jjdbc:mysql://localhost:3306/ecommerce_myshop
+    username: admin
+    password: root
     driver-class-name: com.mysql.cj.jdbc.Driver
     hikari:
       initializationFailTimeout: 0
-
 
   jpa:
     hibernate:
@@ -29,7 +28,7 @@ eureka:
       defaultZone: http://eureka-service:8761/eureka
 
 jwt:
-  secret: ${JWT_SECRET}
+  secret: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiYWRtaW4iOnRydWUsImlhdCI6MTUxNjIzOTAyMn0.KMUFsIDTnFmyG3nMiGM6H9FNFUROf3wh7SmqJp-QV30 
 
 management:
   endpoints:
