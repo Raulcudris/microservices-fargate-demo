@@ -6,7 +6,7 @@ spring:
     name: msvc-users
 
   datasource:
-    url: jjdbc:mysql://localhost:3306/ecommerce_myshop
+    url: jdbc:mysql://localhost:3306/ecommerce_myshop
     username: admin
     password: root
     driver-class-name: com.mysql.cj.jdbc.Driver
