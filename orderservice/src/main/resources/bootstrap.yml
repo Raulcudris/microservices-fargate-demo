@@ -1,14 +1,7 @@
 spring:
   application:
     name: msvc-orders
-    
   cloud:
     config:
       enabled: true
-      uri: ${SPRING_CLOUD_CONFIG_URI:http://configservice.microservices-fargate-demo.local:8081}
-      fail-fast: ${SPRING_CLOUD_CONFIG_FAIL_FAST:false}
-      retry:
-        max-attempts: 30
-        initial-interval: 2000
-        multiplier: 1.5
-        max-interval: 15000
+      uri: http://configservice:8081

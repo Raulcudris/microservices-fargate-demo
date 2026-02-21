@@ -3,7 +3,7 @@ package com.makiia.paymentservice.client;
 import org.springframework.cloud.openfeign.FeignClient;
 import org.springframework.web.bind.annotation.*;
 
-@FeignClient(name = "order-service", url = "http://orderservice:8002")
+@FeignClient(name = "order-service", url = "http://localhost:8002")
 public interface OrderClient {
 
     @PutMapping("/orders/{orderId}/confirm")

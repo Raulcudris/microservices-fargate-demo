@@ -1,120 +1,197 @@
-version: '3.8'
+version: "3.8"
+
+x-common-env: &common-env
+  SPRING_PROFILES_ACTIVE: ${SPRING_PROFILES_ACTIVE}
+  SPRING_CLOUD_CONFIG_URI: ${SPRING_CLOUD_CONFIG_URI}
+  SPRING_CLOUD_CONFIG_FAILFAST: "false"
+  EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: ${EUREKA_CLIENT_SERVICEURL_DEFAULTZONE}
+  JWT_SECRET: ${JWT_SECRET}
+
+x-db-env: &db-env
+  SPRING_DATASOURCE_URL: ${SPRING_DATASOURCE_URL}
+  SPRING_DATASOURCE_USERNAME: ${SPRING_DATASOURCE_USERNAME}
+  SPRING_DATASOURCE_PASSWORD: ${SPRING_DATASOURCE_PASSWORD}
 
 services:
-  configservice:
-    build: ./configservice
-    container_name: configservice
-    ports:
-      - "8081:8081"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://configservice:8081/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 20s
 
-  eurekaservice:
-    build: ./eurekaservice
-    container_name: eurekaservice
-    ports:
-      - "8761:8761"
+  config-service:
+    build:
+      context: ./configservice
+      dockerfile: docker/Dockerfile
+    env_file: [.env]
     environment:
-      - CONFIG_SERVICE_URL=http://configservice:8081
-    depends_on:
-      - configservice
+      SPRING_APPLICATION_NAME: configservice
+      SERVER_PORT: ${PORT_CONFIG}          # 8081
+      SPRING_PROFILES_ACTIVE: native
+      SPRING_CLOUD_CONFIG_SERVER_NATIVE_SEARCH_LOCATIONS: file:/config-data
+      JAVA_TOOL_OPTIONS: ${JAVA_TOOL_OPTIONS_SMALL}
+    volumes:
+      - ./config-data:/config-data:ro
+    restart: unless-stopped
+    networks: [backend-net]
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://eurekaservice:8761/actuator/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 20s
+      test: ["CMD-SHELL", "curl -fsS http://localhost:${PORT_CONFIG}/actuator/health | grep -q '\"status\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 25s
 
-  gatewayservice:
-    build: ./gatewayservice
-    container_name: gatewayservice
-    ports:
-      - "8080:8080"
-    environment:
-      - EUREKA_URL=http://eurekaservice:8761
-      - CONFIG_SERVICE_URL=http://configservice:8081
+  eureka-service:
+    build:
+      context: ./eurekaservice
+      dockerfile: docker/Dockerfile
+    env_file: [.env]
     depends_on:
-      - eurekaservice
-      - configservice
+      config-service:
+        condition: service_healthy
+    environment:
+      SPRING_APPLICATION_NAME: msvc-eureka
+      SERVER_PORT: ${PORT_EUREKA}          # 8761
+      <<: *common-env
+      JAVA_TOOL_OPTIONS: ${JAVA_TOOL_OPTIONS_SMALL}
+    restart: unless-stopped
+    networks: [backend-net]
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://gatewayservice:8080/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 20s
+      test: ["CMD-SHELL", "curl -fsS http://localhost:${PORT_EUREKA}/actuator/health | grep -q '\"status\"' || curl -fsS http://localhost:${PORT_EUREKA}/ | grep -qi eureka"]
+      interval: 10s
+      timeout: 5s
+      retries: 25
+      start_period: 35s
 
-  orderservice:
-    build: ./orderservice
-    container_name: orderservice
+  gateway-service:
+    build:
+      context: ./gatewayservice
+      dockerfile: docker/Dockerfile
+    env_file: [.env]
     ports:
-      - "8002:8002"
-    environment:
-      - EUREKA_URL=http://eurekaservice:8761
-      - CONFIG_SERVICE_URL=http://configservice:8081
-      - GATEWAY_URL=http://gatewayservice:8080
+      - "80:${PORT_GATEWAY}"               # 80 -> 8080
     depends_on:
-      - gatewayservice
+      config-service:
+        condition: service_healthy
+      eureka-service:
+        condition: service_healthy
+    environment:
+      SPRING_APPLICATION_NAME: msvc-gateway
+      SERVER_PORT: ${PORT_GATEWAY}         # 8080
+      <<: *common-env
+      JAVA_TOOL_OPTIONS: ${JAVA_TOOL_OPTIONS_GATEWAY}
+    restart: unless-stopped
+    networks: [backend-net]
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://orderservice:8002/orders/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 20s
+      test: ["CMD-SHELL", "curl -fsS http://localhost:${PORT_GATEWAY}/actuator/health | grep -q '\"status\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 25s
 
-  paymentservice:
-    build: ./paymentservice
-    container_name: paymentservice
-    ports:
-      - "8003:8003"
-    environment:
-      - EUREKA_URL=http://eurekaservice:8761
-      - CONFIG_SERVICE_URL=http://configservice:8081
-      - GATEWAY_URL=http://gatewayservice:8080
+  users-service:
+    build:
+      context: ./userservice
+      dockerfile: docker/Dockerfile
+    env_file: [.env]
     depends_on:
-      - gatewayservice
+      config-service:
+        condition: service_healthy
+      eureka-service:
+        condition: service_healthy
+    environment:
+      SPRING_APPLICATION_NAME: msvc-users
+      SERVER_PORT: ${PORT_USERS}           # 8004
+      <<: *common-env
+      <<: *db-env
+      JAVA_TOOL_OPTIONS: ${JAVA_TOOL_OPTIONS_SMALL}
+    volumes:
+      - ./certs:/certs:ro
+    restart: unless-stopped
+    networks: [backend-net]
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://paymentservice:8003/payments/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 20s
+      test: ["CMD-SHELL", "curl -fsS http://localhost:${PORT_USERS}/actuator/health | grep -q '\"status\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 25s
 
-  productservice:
-    build: ./productservice
-    container_name: productservice
-    ports:
-      - "8001:8001"
-    environment:
-      - EUREKA_URL=http://eurekaservice:8761
-      - CONFIG_SERVICE_URL=http://configservice:8081
-      - GATEWAY_URL=http://gatewayservice:8080
+  products-service:
+    build:
+      context: ./productservice
+      dockerfile: docker/Dockerfile
+    env_file: [.env]
     depends_on:
-      - gatewayservice
+      config-service:
+        condition: service_healthy
+      eureka-service:
+        condition: service_healthy
+    environment:
+      SPRING_APPLICATION_NAME: msvc-products
+      SERVER_PORT: ${PORT_PRODUCTS}        # 8001
+      <<: *common-env
+      <<: *db-env
+      JAVA_TOOL_OPTIONS: ${JAVA_TOOL_OPTIONS_SMALL}
+    volumes:
+      - ./certs:/certs:ro
+    restart: unless-stopped
+    networks: [backend-net]
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://productservice:8001/products/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 20s
+      test: ["CMD-SHELL", "curl -fsS http://localhost:${PORT_PRODUCTS}/actuator/health | grep -q '\"status\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 25s
 
-  userservice:
-    build: ./userservice
-    container_name: userservice
-    ports:
-      - "8004:8004"
-    environment:
-      - EUREKA_URL=http://eurekaservice:8761
-      - CONFIG_SERVICE_URL=http://configservice:8081
-      - GATEWAY_URL=http://gatewayservice:8080
+  orders-service:
+    build:
+      context: ./orderservice
+      dockerfile: docker/Dockerfile
+    env_file: [.env]
     depends_on:
-      - gatewayservice
+      config-service:
+        condition: service_healthy
+      eureka-service:
+        condition: service_healthy
+    environment:
+      SPRING_APPLICATION_NAME: msvc-orders
+      SERVER_PORT: ${PORT_ORDERS}          # 8002
+      <<: *common-env
+      <<: *db-env
+      JAVA_TOOL_OPTIONS: ${JAVA_TOOL_OPTIONS_SMALL}
+    volumes:
+      - ./certs:/certs:ro
+    restart: unless-stopped
+    networks: [backend-net]
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://userservice:8004/users/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 20s
+      test: ["CMD-SHELL", "curl -fsS http://localhost:${PORT_ORDERS}/actuator/health | grep -q '\"status\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 25s
+
+  payment-service:
+    build:
+      context: ./paymentservice
+      dockerfile: docker/Dockerfile
+    env_file: [.env]
+    depends_on:
+      config-service:
+        condition: service_healthy
+      eureka-service:
+        condition: service_healthy
+    environment:
+      SPRING_APPLICATION_NAME: msvc-pay
+      SERVER_PORT: ${PORT_PAY}             # 8003
+      <<: *common-env
+      <<: *db-env
+      JAVA_TOOL_OPTIONS: ${JAVA_TOOL_OPTIONS_SMALL}
+    volumes:
+      - ./certs:/certs:ro
+    restart: unless-stopped
+    networks: [backend-net]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:${PORT_PAY}/actuator/health | grep -q '\"status\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 25s
+
+networks:
+  backend-net:
+    driver: bridge

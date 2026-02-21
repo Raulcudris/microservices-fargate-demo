@@ -6,14 +6,12 @@ spring:
     name: msvc-products
 
   datasource:
-    url: jdbc:mysql://${DB_HOST:localhost}:${DB_PORT:3306}/${DB_NAME:ecommerce_myshop}?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
-    username: ${DB_USER:admin}
-    password: ${DB_PASS:}
+    url: jdbc:mysql://${DB_HOST}:${DB_PORT}/${DB_NAME}?useSSL=true&serverTimezone=UTC&allowPublicKeyRetrieval=true
+    username: ${DB_USER}
+    password: ${DB_PASSWORD}
     driver-class-name: com.mysql.cj.jdbc.Driver
     hikari:
       initializationFailTimeout: 0
-      connectionTimeout: 30000
-      maximumPoolSize: 10
 
   jpa:
     hibernate:
@@ -23,20 +21,14 @@ spring:
         dialect: org.hibernate.dialect.MySQL8Dialect
 
 eureka:
-  instance:
-    prefer-ip-address: true
-    instance-id: ${spring.application.name}:${HOSTNAME:${random.value}}
   client:
     fetch-registry: true
     register-with-eureka: true
     service-url:
-      defaultZone: ${EUREKA_CLIENT_SERVICEURL_DEFAULTZONE:http://eurekaservice.microservices-fargate-demo.local:8761/eureka/}
+      defaultZone: http://eureka-service:8761/eureka
 
 management:
   endpoints:
     web:
       exposure:
         include: health,info
-  endpoint:
-    health:
-      show-details: always

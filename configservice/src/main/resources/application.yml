@@ -4,7 +4,6 @@ server:
 spring:
   application:
     name: configservice
-
   cloud:
     config:
       server:
@@ -12,16 +11,3 @@ spring:
           uri: https://github.com/Raulcudris/microservices-fargate-demo.git
           default-label: main
           search-paths: config-data
-          clone-on-start: true
-          # Si el repo llega a ser privado, usa env vars / Secrets:
-          #username: ${GIT_NAME:}
-          #password: ${GIT_TOKEN:}
-
-management:
-  endpoints:
-    web:
-      exposure:
-        include: health,info
-  endpoint:
-    health:
-      show-details: always

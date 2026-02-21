@@ -1,13 +1,10 @@
 package com.makiia.orderservice.controller;
 import com.makiia.orderservice.dto.CreateOrderDto;
-import com.makiia.orderservice.dto.HealthResponse;
 import com.makiia.orderservice.dto.OrderResponseDto;
 import com.makiia.orderservice.service.OrderService;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
-
-import java.time.LocalDateTime;
 import java.util.List;
 
 @RestController
@@ -18,20 +15,6 @@ public class OrderController {
 
     public OrderController(OrderService orderService) {
         this.orderService = orderService;
-    }
-
-    // =============================
-    // HEALTH ENDPOINT
-    // =============================
-    @GetMapping("/health")
-    public ResponseEntity<HealthResponse> health() {
-        HealthResponse response = new HealthResponse(
-                "UP",
-                "Orders Service",
-                LocalDateTime.now().toString()
-        );
-
-        return ResponseEntity.ok(response);
     }
 
     // 📌 Listar órdenes

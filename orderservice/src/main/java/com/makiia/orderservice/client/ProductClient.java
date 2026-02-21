@@ -6,7 +6,7 @@ import org.springframework.web.bind.annotation.*;
 
 @FeignClient(
         name = "product-service",
-        url = "http://productservice:8001"
+        url = "http://localhost:8001"
 )
 public interface ProductClient {
 

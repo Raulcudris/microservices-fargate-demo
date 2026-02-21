@@ -36,16 +36,15 @@ spring:
           uri: lb://msvc-users
           predicates:
             - Path=/users/**
+          filters:
+            - AuthFilter
 
 eureka:
-  instance:
-    prefer-ip-address: true
-    instance-id: ${spring.application.name}:${HOSTNAME:${random.value}}
   client:
     fetch-registry: true
     register-with-eureka: true
     service-url:
-      defaultZone: ${EUREKA_CLIENT_SERVICEURL_DEFAULTZONE:http://eurekaservice.microservices-fargate-demo.local:8761/eureka/}
+      defaultZone: http://eureka-service:8761/eureka/
 
 management:
   endpoints:
