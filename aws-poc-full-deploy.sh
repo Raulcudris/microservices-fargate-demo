@@ -338,18 +338,34 @@ service_exists_ecs() {
     --query "services[0].status" --output text 2>/dev/null | grep -vq "None"
 }
 
+# Devuelve el registryArn real (Cloud Map) desde un serviceId (srv-xxxx)
+sd_registry_arn_from_id() {
+  local sd_service_id="$1"
+  # serviceId viene como "srv-xxxx"
+  echo "arn:aws:servicediscovery:${REGION}:${ACCOUNT_ID}:service/${sd_service_id}"
+}
+
 create_or_update_service_sd() {
   local svc="$1"; local td="$2"; local net="$3"; local sd_service_id="$4"
+  local registry_arn
+  registry_arn="$(sd_registry_arn_from_id "$sd_service_id")"
+
   if service_exists_ecs "$svc"; then
-    log "ECS service existe, actualizando (force-new-deployment): $svc"
+    log "ECS service existe, actualizando (td + net + registry + force-new-deployment): $svc"
+    # 🔥 Importante: actualizar NETWORK + REGISTRY también (no solo task-definition)
     awsq ecs update-service --cluster "$CLUSTER_NAME" --service "$svc" \
-      --task-definition "$td" --desired-count 1 --force-new-deployment >/dev/null
+      --task-definition "$td" \
+      --network-configuration "$net" \
+      --service-registries "registryArn=$registry_arn" \
+      --desired-count 1 \
+      --force-new-deployment >/dev/null
     return 0
   fi
+
   awsq ecs create-service --cluster "$CLUSTER_NAME" --service-name "$svc" \
     --task-definition "$td" --desired-count 1 --launch-type FARGATE \
     --network-configuration "$net" \
-    --service-registries "registryArn=arn:aws:servicediscovery:${REGION}:${ACCOUNT_ID}:service/${sd_service_id}" \
+    --service-registries "registryArn=$registry_arn" \
     --health-check-grace-period-seconds 120 \
     >/dev/null
 }
@@ -357,23 +373,30 @@ create_or_update_service_sd() {
 create_or_update_service_sd_lb() {
   local svc="$1"; local td="$2"; local net="$3"; local sd_service_id="$4"
   local tg="$5"; local cname="$6"; local cport="$7"
+  local registry_arn
+  registry_arn="$(sd_registry_arn_from_id "$sd_service_id")"
 
   if service_exists_ecs "$svc"; then
-    log "ECS service existe, actualizando (force-new-deployment): $svc"
+    log "ECS service existe, actualizando (td + net + registry + force-new-deployment): $svc"
+    # 🔥 Importante: actualizar NETWORK + REGISTRY también
+    # Nota: el LB normalmente ya queda asociado, no hace falta re-declararlo en update-service.
     awsq ecs update-service --cluster "$CLUSTER_NAME" --service "$svc" \
-      --task-definition "$td" --desired-count 1 --force-new-deployment >/dev/null
+      --task-definition "$td" \
+      --network-configuration "$net" \
+      --service-registries "registryArn=$registry_arn" \
+      --desired-count 1 \
+      --force-new-deployment >/dev/null
     return 0
   fi
 
   awsq ecs create-service --cluster "$CLUSTER_NAME" --service-name "$svc" \
     --task-definition "$td" --desired-count 1 --launch-type FARGATE \
     --network-configuration "$net" \
-    --service-registries "registryArn=arn:aws:servicediscovery:${REGION}:${ACCOUNT_ID}:service/${sd_service_id}" \
+    --service-registries "registryArn=$registry_arn" \
     --load-balancers "targetGroupArn=$tg,containerName=$cname,containerPort=$cport" \
     --health-check-grace-period-seconds 180 \
     >/dev/null
 }
-
 # -------------------------
 # PRECHECKS
 # -------------------------
@@ -549,7 +572,7 @@ if ! is_step_done "NAT"; then
   step_done "NAT"
 fi
 # -------------------------
-# STEP 2) Security Groups + VPC Endpoints (sin NAT)
+# STEP 2) Security Groups + VPC Endpoints 
 # -------------------------
 if ! is_step_done 2; then
   log "2) SG + VPC Endpoints (sin NAT)..."
@@ -572,6 +595,11 @@ if ! is_step_done 2; then
   # Gateway 8080 desde ALB -> ECS privado
   awsq ec2 authorize-security-group-ingress --group-id "$SG_ECS_PRIVATE_ID" \
     --ip-permissions "[{\"IpProtocol\":\"tcp\",\"FromPort\":${PORT_GATEWAY},\"ToPort\":${PORT_GATEWAY},\"UserIdGroupPairs\":[{\"GroupId\":\"${SG_ALB_ID}\"}]}]" >/dev/null 2>&1 || true
+
+  # ✅ Permitir TODO el tráfico interno entre tasks privadas (self SG)
+  awsq ec2 authorize-security-group-ingress --group-id "$SG_ECS_PRIVATE_ID" \
+    --ip-permissions "[{\"IpProtocol\":\"-1\",\"UserIdGroupPairs\":[{\"GroupId\":\"${SG_ECS_PRIVATE_ID}\"}]}]" \
+    >/dev/null 2>&1 || true
 
   # Config 8081 desde ECS privado -> Config en público
   awsq ec2 authorize-security-group-ingress --group-id "$SG_CONFIG_ID" \
@@ -609,7 +637,6 @@ if ! is_step_done 2; then
 
   step_done 2
 fi
-
 # -------------------------
 # STEP 3) ECR + build/push
 # -------------------------
@@ -1053,13 +1080,18 @@ if ! is_step_done 11; then
   SG_CONFIG_ID="$(state_get SG_CONFIG_ID)"
   SG_ECS_PRIVATE_ID="$(state_get SG_ECS_PRIVATE_ID)"
 
+  # ✅ ConfigService en subnets PUBLICAS + Public IP (para poder clonar GitHub sin NAT)
   NETCONF_CONFIG="awsvpcConfiguration={subnets=[$PUB1_ID,$PUB2_ID],securityGroups=[$SG_CONFIG_ID],assignPublicIp=ENABLED}"
+
+  # ✅ Resto en subnets PRIVADAS (sin Public IP)
   NETCONF_PRIVATE="awsvpcConfiguration={subnets=[$PRI1_ID,$PRI2_ID],securityGroups=[$SG_ECS_PRIVATE_ID],assignPublicIp=DISABLED}"
 
+  # ✅ Orden recomendado para evitar timeouts al arrancar (config -> eureka -> gateway -> demás)
   create_or_update_service_sd    "$SVC_CONFIG"    "$TD_CONFIG_ARN"    "$NETCONF_CONFIG"   "$SD_CONFIG_ID"
   create_or_update_service_sd    "$SVC_EUREKA"    "$TD_EUREKA_ARN"    "$NETCONF_PRIVATE"  "$SD_EUREKA_ID"
   create_or_update_service_sd_lb "$SVC_GATEWAY"   "$TD_GATEWAY_ARN"   "$NETCONF_PRIVATE"  "$SD_GATEWAY_ID" \
     "$TG_GW_ARN" "gatewayservice" "$PORT_GATEWAY"
+
   create_or_update_service_sd    "$SVC_PRODUCTS"  "$TD_PRODUCTS_ARN"  "$NETCONF_PRIVATE"  "$SD_PRODUCTS_ID"
   create_or_update_service_sd    "$SVC_ORDERS"    "$TD_ORDERS_ARN"    "$NETCONF_PRIVATE"  "$SD_ORDERS_ID"
   create_or_update_service_sd    "$SVC_PAY"       "$TD_PAY_ARN"       "$NETCONF_PRIVATE"  "$SD_PAY_ID"
