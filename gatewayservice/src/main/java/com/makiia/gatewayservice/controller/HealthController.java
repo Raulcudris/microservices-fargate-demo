@@ -9,7 +9,7 @@ import java.time.LocalDateTime;
 
 @RestController
 public class HealthController {
-    @GetMapping("/health")
+    @GetMapping("actuactor/health")
     public Mono<HealthResponse> health() {
         return Mono.just(
                 new HealthResponse(

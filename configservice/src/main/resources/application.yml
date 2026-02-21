@@ -9,5 +9,5 @@ spring:
       server:
         git:
           uri: https://github.com/Raulcudris/microservices-fargate-demo.git
-          default-label: main
+          default-label: deploy
           search-paths: config-data
