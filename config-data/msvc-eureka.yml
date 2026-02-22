@@ -10,7 +10,8 @@ eureka:
     register-with-eureka: false
     fetch-registry: false
   instance:
-    hostname: localhost
+    # Para contenedores (Docker/ECS): evita localhost fijo
+    prefer-ip-address: true
 
 management:
   endpoints:

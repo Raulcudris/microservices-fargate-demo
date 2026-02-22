@@ -4,4 +4,5 @@ spring:
   cloud:
     config:
       enabled: true
-      uri: http://localhost:8081
+      uri: ${SPRING_CLOUD_CONFIG_URI:http://config-service:8081}
+      fail-fast: false

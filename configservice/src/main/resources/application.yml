@@ -4,10 +4,25 @@ server:
 spring:
   application:
     name: configservice
+
   cloud:
     config:
       server:
         git:
-          uri: https://github.com/Raulcudris/microservices-fargate-demo.git
-          default-label: deploy
-          search-paths: config-data
+          uri: ${CONFIG_GIT_URI:https://github.com/Raulcudris/microservices-fargate-demo.git}
+          default-label: ${CONFIG_GIT_BRANCH:deploy}
+          search-paths: ${CONFIG_GIT_PATHS:config-data}
+          clone-on-start: true
+          force-pull: true
+          # Si el repo es privado, define estas variables en ECS con Secrets Manager
+          username: ${CONFIG_GIT_USERNAME:}
+          password: ${CONFIG_GIT_TOKEN:}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: always
