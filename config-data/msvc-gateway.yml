@@ -15,35 +15,27 @@ spring:
           uri: lb://msvc-products
           predicates:
             - Path=/products/**
-          filters:
-            - AuthFilter
 
         - id: orders-services
           uri: lb://msvc-orders
           predicates:
             - Path=/orders/**
-          filters:
-            - AuthFilter
 
         - id: payments-services
           uri: lb://msvc-pay
           predicates:
             - Path=/pay/**
-          filters:
-            - AuthFilter
 
         - id: users-services
           uri: lb://msvc-users
           predicates:
             - Path=/users/**
-          filters:
-            - AuthFilter
 
 eureka:
   client:
     service-url:
       defaultZone: http://localhost:8761/eureka/
-      
+
 management:
   endpoints:
     web:
