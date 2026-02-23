@@ -20,6 +20,70 @@ log() { echo -e "${BLUE}[$(date +'%Y-%m-%d %H:%M:%S')] 👉${NC} $*"; }
 ok()  { echo -e "${GREEN}[$(date +'%Y-%m-%d %H:%M:%S')] ✅${NC} $*"; }
 warn(){ echo -e "${YELLOW}[$(date +'%Y-%m-%d %H:%M:%S')] ⚠️${NC} $*"; }
 error(){ echo -e "${RED}[$(date +'%Y-%m-%d %H:%M:%S')] ❌${NC} $*"; }
+# -------------------------
+# FUNCIÓN PARA VERIFICAR CUOTA DE EIPS
+# -------------------------
+# -------------------------
+# FUNCIÓN PARA VERIFICAR CUOTA DE EIPS (VERSIÓN CORREGIDA)
+# -------------------------
+check_eip_quota() {
+  local account_id
+  account_id="$(aws sts get-caller-identity --query Account --output text)"
+  
+  # Intentar obtener límite de Service Quotas (si está disponible)
+  local eip_quota=5  # valor por defecto
+  if command -v aws service-quotas &>/dev/null; then
+    eip_quota_raw="$(aws service-quotas get-service-quota \
+      --service-code ec2 \
+      --quota-code L-0263D0A3 \
+      --region "$REGION" \
+      --query 'Quota.Value' --output text 2>/dev/null || echo "5")"
+    
+    # Convertir a entero (eliminar parte decimal)
+    eip_quota="${eip_quota_raw%.*}"
+  fi
+  
+  local eips_in_use
+  eips_in_use_raw="$(awsq ec2 describe-addresses \
+    --query 'length(Addresses[?Domain==`vpc`])' \
+    --output text 2>/dev/null || echo "0")"
+  
+  # Convertir a entero
+  eips_in_use="${eips_in_use_raw%.*}"
+  
+  log "EIPs en uso: $eips_in_use / $eip_quota"
+  
+  if [[ $eips_in_use -ge $eip_quota ]]; then
+    warn "⚠️  Límite de EIPs alcanzado ($eips_in_use/$eip_quota)"
+    
+    # Mostrar EIPs en uso
+    echo ""
+    echo "📋 EIPs en uso en región $REGION:"
+    awsq ec2 describe-addresses --output table --query 'Addresses[*].[PublicIp,InstanceId,NetworkInterfaceId,Tags[?Key==`Name`].Value|[0]]' 2>/dev/null || true
+    echo ""
+    
+    # Buscar EIPs no asociadas
+    local unused_eips
+    unused_eips="$(awsq ec2 describe-addresses \
+      --filters "Name=domain,Values=vpc" \
+      --query 'Addresses[?AssociationId==null].[AllocationId,PublicIp]' \
+      --output text 2>/dev/null || true)"
+    
+    if [[ -n "$unused_eips" ]]; then
+      warn "Hay EIPs sin asociar. Puedes liberarlas con:"
+      echo ""
+      echo "$unused_eips" | while read -r alloc_id ip; do
+        if [[ -n "$alloc_id" && "$alloc_id" != "None" ]]; then
+          echo "   aws ec2 release-address --allocation-id $alloc_id --region $REGION"
+        fi
+      done
+      echo ""
+    fi
+    
+    return 1
+  fi
+  return 0
+}
 
 # -------------------------
 # CARGA DE VARIABLES DE ENTORNO DESDE .ENV
@@ -114,10 +178,10 @@ export DIR_ORDERS="${DIR_ORDERS:-./orderservice}"
 export DIR_PAY="${DIR_PAY:-./paymentservice}"
 export DIR_USERS="${DIR_USERS:-./userservice}"
 
-# Puertos de contenedores
+# En la sección de PORTS (cerca del inicio del script)
 declare -A PORTS=(
   [config]=8081
-  [eureka]=8761
+  [eureka]=8761  # Cambiado de 8080 a 8761
   [gateway]=8080
   [products]=8001
   [orders]=8002
@@ -713,16 +777,39 @@ else
   IGW_ID="$(state_get IGW_ID)"
 fi
 # -------------------------
-# STEP 1b: NAT Gateway (si aplica)
+# STEP 1b: NAT Gateway (si aplica) - VERSIÓN CORREGIDA
 # -------------------------
 if [[ "$MODE_NO_NAT" != "true" ]] && ! is_step_done NAT; then
   log "STEP 1b: Creando NAT Gateway..."
   
-  NAT_EIP_ALLOC_ID="$(state_get NAT_EIP_ALLOC_ID)"
-  if [[ -z "$NAT_EIP_ALLOC_ID" ]]; then
-    NAT_EIP_ALLOC_ID="$(awsq ec2 allocate-address --domain vpc --query AllocationId --output text)"
-    state_set NAT_EIP_ALLOC_ID "$NAT_EIP_ALLOC_ID"
-    ok "EIP para NAT asignado: $NAT_EIP_ALLOC_ID"
+  # Verificar quota de EIPs
+  if ! check_eip_quota; then
+    # Si la quota está llena, intentar usar una EIP no asociada
+    log "Buscando EIPs no asociadas para reutilizar..."
+    
+    UNUSED_EIP="$(awsq ec2 describe-addresses \
+      --filters "Name=domain,Values=vpc" \
+      --query 'Addresses[?AssociationId==null].AllocationId | [0]' \
+      --output text 2>/dev/null | grep -v "None" || true)"
+    
+    if [[ -n "$UNUSED_EIP" ]]; then
+      warn "Reutilizando EIP no asociada: $UNUSED_EIP"
+      NAT_EIP_ALLOC_ID="$UNUSED_EIP"
+      state_set NAT_EIP_ALLOC_ID "$NAT_EIP_ALLOC_ID"
+      ok "EIP existente reutilizada: $NAT_EIP_ALLOC_ID"
+    else
+      error "Límite de EIPs alcanzado y no hay EIPs sin usar disponibles."
+      error "Solicita aumento de límite en Service Quotas o libera EIPs no usadas."
+      exit 1
+    fi
+  else
+    # Hay espacio para crear nueva EIP
+    NAT_EIP_ALLOC_ID="$(state_get NAT_EIP_ALLOC_ID)"
+    if [[ -z "$NAT_EIP_ALLOC_ID" ]]; then
+      NAT_EIP_ALLOC_ID="$(awsq ec2 allocate-address --domain vpc --query AllocationId --output text)"
+      state_set NAT_EIP_ALLOC_ID "$NAT_EIP_ALLOC_ID"
+      ok "Nueva EIP para NAT asignada: $NAT_EIP_ALLOC_ID"
+    fi
   fi
   
   NAT_GW_ID="$(state_get NAT_GW_ID)"
@@ -748,7 +835,6 @@ if [[ "$MODE_NO_NAT" != "true" ]] && ! is_step_done NAT; then
   
   step_done NAT
 fi
-
 # -------------------------
 # STEP 2: Security Groups
 # -------------------------
@@ -1274,9 +1360,10 @@ if ! is_step_done 10; then
     ]')"
   
   ENV_EUREKA="$(merge_json_arrays "$ENV_CLIENT_BASE" "$(jq -nc '[
+    {"name":"SERVER_PORT","value":"8761"},
     {"name":"EUREKA_CLIENT_REGISTER_WITH_EUREKA","value":"false"},
     {"name":"EUREKA_CLIENT_FETCH_REGISTRY","value":"false"}
-  ]')")"
+    ]')")"
   
   # Secrets
   SECRETS_DB="[]"
