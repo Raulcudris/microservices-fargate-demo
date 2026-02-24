@@ -10,39 +10,53 @@ spring:
       discovery:
         locator:
           enabled: true
+          lower-case-service-id: true  # Importante para CloudMap
       routes:
-        - id: products-services
+        - id: products-service
           uri: lb://msvc-products
           predicates:
-            - Path=/products/**
+            - Path=/api/products/**
+          filters:
+            - StripPrefix=1  # /api/products/** → /products/**
 
-        - id: orders-services
+        - id: orders-service
           uri: lb://msvc-orders
           predicates:
-            - Path=/orders/**
+            - Path=/api/orders/**
+          filters:
+            - StripPrefix=1
 
-        - id: payments-services
+        - id: payments-service
           uri: lb://msvc-pay
           predicates:
-            - Path=/pay/**
+            - Path=/api/payments/**
+          filters:
+            - StripPrefix=1
 
-        - id: users-services
+        - id: users-service
           uri: lb://msvc-users
           predicates:
-            - Path=/users/**
+            - Path=/api/users/**
+          filters:
+            - StripPrefix=1
 
 eureka:
   client:
     service-url:
-      # En Docker: http://eureka-service:8761/eureka/
-      # En ECS/CloudMap: http://eurekaservice:8761/eureka/ (según nombre)
-      defaultZone: ${EUREKA_CLIENT_SERVICEURL_DEFAULTZONE:http://eureka-service:8761/eureka/}
+      defaultZone: ${EUREKA_CLIENT_SERVICEURL_DEFAULTZONE:http://eurekaservice.microservices-fargate.local:8761/eureka/}
+    registry-fetch-interval-seconds: 5
+    initial-instance-info-replication-interval-seconds: 5
+  instance:
+    prefer-ip-address: true
+    lease-renewal-interval-in-seconds: 10
+    metadata-map:
+      startup: ${random.int}
 
 management:
   endpoints:
     web:
       exposure:
-        include: health,info
+        include: health,info,gateway
   endpoint:
     health:
       show-details: always

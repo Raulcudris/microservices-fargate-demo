@@ -14,9 +14,15 @@ spring:
           search-paths: ${CONFIG_GIT_PATHS:config-data}
           clone-on-start: true
           force-pull: true
+          # ⚠️ IMPORTANTE: Directorio temporal para evitar error de permisos en Fargate
+          basedir: /tmp/config-repo
           # Si el repo es privado, define estas variables en ECS con Secrets Manager
           username: ${CONFIG_GIT_USERNAME:}
           password: ${CONFIG_GIT_TOKEN:}
+
+          # ⚠️ IMPORTANTE: Evitar que intente guardar en /home/spring/.config/jgit
+          jgit:
+            config: /tmp/jgit.config
 
 management:
   endpoints:

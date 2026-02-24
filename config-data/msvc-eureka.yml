@@ -1,5 +1,6 @@
 server:
   port: 8761
+  wait-time-in-ms-when-sync-empty: 0  # Inicio más rápido en ECS
 
 spring:
   application:
@@ -10,8 +11,15 @@ eureka:
     register-with-eureka: false
     fetch-registry: false
   instance:
-    # Para contenedores (Docker/ECS): evita localhost fijo
     prefer-ip-address: true
+    # Para CloudMap en ECS
+    hostname: ${EUREKA_INSTANCE_HOSTNAME:eurekaservice.microservices-fargate.local}
+    lease-renewal-interval-in-seconds: 10
+    lease-expiration-duration-in-seconds: 30
+
+  server:
+    enable-self-preservation: false  # Para desarrollo, en producción considera true
+    eviction-interval-timer-in-ms: 5000
 
 management:
   endpoints:
