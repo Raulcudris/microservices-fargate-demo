@@ -14,8 +14,6 @@ spring:
           search-paths: ${CONFIG_GIT_PATHS:config-data}
           clone-on-start: true
           force-pull: true
-          # Directorio donde clonar el repo (con permisos de escritura)
-          basedir: /tmp/config-repo
           # Si el repo es privado, define estas variables en ECS con Secrets Manager
           username: ${CONFIG_GIT_USERNAME:}
           password: ${CONFIG_GIT_TOKEN:}

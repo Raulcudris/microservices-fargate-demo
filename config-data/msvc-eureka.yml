@@ -1,5 +1,5 @@
 server:
-  port: ${SERVER_PORT:8761}  # Toma de variable de entorno, default 8761
+  port: 8761
 
 spring:
   application:
@@ -10,8 +10,8 @@ eureka:
     register-with-eureka: false
     fetch-registry: false
   instance:
+    # Para contenedores (Docker/ECS): evita localhost fijo
     prefer-ip-address: true
-    hostname: ${EUREKA_INSTANCE_HOSTNAME:eurekaservice}  # Importante para DNS
 
 management:
   endpoints:
