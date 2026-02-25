@@ -8,7 +8,7 @@ COPY gradle ./gradle
 COPY build.gradle* settings.gradle* gradle.properties* ./
 RUN chmod +x gradlew && ./gradlew --no-daemon dependencies || true
 
-# Copiar el resto del proyecto (más seguro que solo src)
+# Copiar el resto del proyecto
 COPY . .
 
 # Build jar (Spring Boot)
@@ -18,17 +18,18 @@ RUN ./gradlew --no-daemon clean bootJar -x test
 FROM eclipse-temurin:11-jre-jammy
 WORKDIR /app
 
-# curl útil para healthchecks en compose y troubleshooting
-RUN apt-get update && apt-get install -y --no-install-recommends curl \
+RUN apt-get update && apt-get install -y --no-install-recommends curl mysql-client \
   && rm -rf /var/lib/apt/lists/*
 
-# Usuario no-root
+RUN mkdir -p /tmp && chmod 777 /tmp
+
 RUN groupadd -r spring && useradd -r -g spring spring
 USER spring
 
 COPY --from=build /app/build/libs/*.jar app.jar
 
 ENV JAVA_TOOL_OPTIONS="-XX:MaxRAMPercentage=75.0 -XX:InitialRAMPercentage=25.0 -Djava.security.egd=file:/dev/./urandom"
+ENV HOME=/tmp
 
 EXPOSE 8002
 ENTRYPOINT ["sh","-c","java $JAVA_TOOL_OPTIONS -jar /app/app.jar"]

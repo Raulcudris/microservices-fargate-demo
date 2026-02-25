@@ -2,698 +2,504 @@
 set -euo pipefail
 
 # ============================================================
-# DESTROY SCRIPT MEJORADO
-# - Usa el state file JSON como fuente de verdad
-# - Eliminación ordenada y robusta
-# - Manejo de dependencias y tiempos de espera
-# - Modo dry-run para ver qué se eliminará
+# FULL CLEANUP (AWS) - BORRA TODO lo creado por tu deploy
+# ✅ Borra imágenes ECR SIEMPRE
+# ✅ Borra RDS/Aurora DB SIEMPRE (AUTO)  <-- solicitado
 # ============================================================
 
-# ✅ FIX Git Bash (MSYS) path conversion:
 export MSYS_NO_PATHCONV=1
 export MSYS2_ARG_CONV_EXCL="*"
 
-# Colores
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-PURPLE='\033[0;35m'
-CYAN='\033[0;36m'
-NC='\033[0m'
-
-# Funciones de logging
-log() { echo -e "${BLUE}👉 $*${NC}" >&2; }
-ok()  { echo -e "${GREEN}✅ $*${NC}" >&2; }
-warn(){ echo -e "${YELLOW}⚠️  $*${NC}" >&2; }
-error(){ echo -e "${RED}❌ $*${NC}" >&2; }
-step(){ echo -e "${PURPLE}📦 $*${NC}" >&2; }
-dry(){ echo -e "${CYAN}[DRY-RUN] $*${NC}" >&2; }
-
-# Verificar herramientas necesarias
-need() { 
-  command -v "$1" >/dev/null 2>&1 || { error "Falta '$1'"; exit 1; }
-}
-need aws
-need jq
-
-# Configuración
+# -------------------------
+# LOAD .env
+# -------------------------
 ENV_FILE="${ENV_FILE:-.env}"
+if [[ -f "$ENV_FILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+else
+  echo "⚠️  No encuentro $ENV_FILE. Crea un .env o exporta variables antes de ejecutar."
+  exit 1
+fi
+
+# -------------------------
+# CONFIG
+# -------------------------
 REGION="${REGION:-us-east-1}"
 PROJECT="${PROJECT:-microservices-fargate}"
 ENV_NAME="${ENV_NAME:-prod}"
 
-# Flags de destrucción (seguros por defecto)
-DESTROY_ECR="${DESTROY_ECR:-false}"
-DESTROY_IAM="${DESTROY_IAM:-false}"
-DESTROY_RDS="${DESTROY_RDS:-false}"
-DESTROY_EIP="${DESTROY_EIP:-true}"      # Las EIP siempre se liberan
-FORCE_DESTROY="${FORCE_DESTROY:-false}"  # Modo no interactivo
-DRY_RUN="${DRY_RUN:-false}"              # Modo dry-run (solo mostrar)
+MODE_NO_NAT="${MODE_NO_NAT:-true}"
 
-# State file
+# ✅ FORZADO
+DELETE_ECR_IMAGES="true"
+DELETE_DB="true"
+
+# ✅ Para borrar DB sin prompts:
+SKIP_FINAL_SNAPSHOT="true"          # true = NO final snapshot (borra directo)
+FINAL_SNAPSHOT_PREFIX="${PROJECT}-final"  # si SKIP_FINAL_SNAPSHOT=false
+
+CLUSTER_NAME="${PROJECT}-cluster"
+NAMESPACE_NAME="${PROJECT}.local"
+
+REPOS=(configservice eurekaservice gatewayservice productservice orderservice paymentservice userservice)
+
+SVC_CONFIG="configservice"
+SVC_EUREKA="eurekaservice"
+SVC_GATEWAY="gatewayservice"
+SVC_PRODUCTS="productservice"
+SVC_ORDERS="orderservice"
+SVC_PAY="paymentservice"
+SVC_USERS="userservice"
+ECS_SERVICES=("$SVC_CONFIG" "$SVC_EUREKA" "$SVC_GATEWAY" "$SVC_PRODUCTS" "$SVC_ORDERS" "$SVC_PAY" "$SVC_USERS")
+
+TG_GW_NAME="msf-tg-gw"
+ALB_NAME="msf-alb"
+
 STATE_FILE=".deploy_state.${PROJECT}.${REGION}.json"
-[[ -f "$STATE_FILE" ]] || { error "No encuentro STATE_FILE: $STATE_FILE"; exit 1; }
 
+# -------------------------
+# HELPERS
+# -------------------------
+need() { command -v "$1" >/dev/null 2>&1 || { echo "❌ Falta '$1'"; exit 1; }; }
+log() { echo -e "👉 $*" >&2; }
+ok()  { echo -e "✅ $*" >&2; }
+warn(){ echo -e "⚠️  $*" >&2; }
 awsq() { aws --region "$REGION" "$@"; }
-safe() { "$@" >/dev/null 2>&1 || true; }
-safe_dry() { 
-  if [[ "$DRY_RUN" == "true" ]]; then
-    dry "$*"
+sanitize_token() { echo "${1:-}" | awk '{print $1}'; }
+
+state_get() {
+  [[ -f "$STATE_FILE" ]] || { echo ""; return 0; }
+  jq -r --arg k "$1" '.[$k] // empty' "$STATE_FILE" 2>/dev/null || true
+}
+
+find_vpc() {
+  awsq ec2 describe-vpcs \
+    --filters "Name=tag:Name,Values=${PROJECT}-vpc" "Name=tag:Project,Values=${PROJECT}" \
+    --query "Vpcs[0].VpcId" --output text 2>/dev/null | grep -v "None" || true
+}
+find_igw() {
+  local vpc="$1"
+  awsq ec2 describe-internet-gateways \
+    --filters "Name=tag:Name,Values=${PROJECT}-igw" "Name=attachment.vpc-id,Values=$vpc" \
+    --query "InternetGateways[0].InternetGatewayId" --output text 2>/dev/null | grep -v "None" || true
+}
+get_tg_arn() {
+  awsq elbv2 describe-target-groups --names "$TG_GW_NAME" --query "TargetGroups[0].TargetGroupArn" --output text 2>/dev/null | grep -v "None" || true
+}
+get_alb_arn() {
+  awsq elbv2 describe-load-balancers --names "$ALB_NAME" --query "LoadBalancers[0].LoadBalancerArn" --output text 2>/dev/null | grep -v "None" || true
+}
+
+# -------------------------
+# VALIDACIONES
+# -------------------------
+need aws
+need jq
+
+log "Cleanup iniciado"
+log "Region : $REGION"
+log "Project: $PROJECT"
+log "Env    : $ENV_NAME"
+log "State  : $STATE_FILE"
+log "DELETE_ECR_IMAGES: $DELETE_ECR_IMAGES (FORZADO)"
+log "DELETE_DB        : $DELETE_DB (FORZADO)"
+log "SKIP_FINAL_SNAPSHOT: $SKIP_FINAL_SNAPSHOT"
+echo ""
+
+ACCOUNT_ID="$(awsq sts get-caller-identity --query Account --output text)"
+ECR="${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com"
+ok "Account: $ACCOUNT_ID"
+ok "ECR    : $ECR"
+echo ""
+
+# -------------------------
+# IDs desde state (si existen)
+# -------------------------
+VPC_ID="$(sanitize_token "$(state_get VPC_ID)")"; [[ -z "$VPC_ID" || "$VPC_ID" == "null" ]] && VPC_ID="$(find_vpc)"
+IGW_ID="$(sanitize_token "$(state_get IGW_ID)")"; [[ -z "$IGW_ID" || "$IGW_ID" == "null" ]] && [[ -n "$VPC_ID" ]] && IGW_ID="$(find_igw "$VPC_ID")"
+
+PUB1_ID="$(sanitize_token "$(state_get PUB1_ID)")"
+PUB2_ID="$(sanitize_token "$(state_get PUB2_ID)")"
+PRI1_ID="$(sanitize_token "$(state_get PRI1_ID)")"
+PRI2_ID="$(sanitize_token "$(state_get PRI2_ID)")"
+
+RTB_PUB_ID="$(sanitize_token "$(state_get RTB_PUB_ID)")"
+RTB_PRI_ID="$(sanitize_token "$(state_get RTB_PRI_ID)")"
+
+SG_ALB_ID="$(sanitize_token "$(state_get SG_ALB_ID)")"
+SG_ECS_PRIVATE_ID="$(sanitize_token "$(state_get SG_ECS_PRIVATE_ID)")"
+SG_CONFIG_ID="$(sanitize_token "$(state_get SG_CONFIG_ID)")"
+SG_VPCE_ID="$(sanitize_token "$(state_get SG_VPCE_ID)")"
+
+NAT_GW_ID="$(sanitize_token "$(state_get NAT_GW_ID)")"
+NAT_EIP_ALLOC_ID="$(sanitize_token "$(state_get NAT_EIP_ALLOC_ID)")"
+
+ALB_ARN="$(sanitize_token "$(state_get ALB_ARN)")"; [[ -z "$ALB_ARN" || "$ALB_ARN" == "null" ]] && ALB_ARN="$(get_alb_arn)"
+TG_GW_ARN="$(sanitize_token "$(state_get TG_GW_ARN)")"; [[ -z "$TG_GW_ARN" || "$TG_GW_ARN" == "null" ]] && TG_GW_ARN="$(get_tg_arn)"
+
+ROLE_NAME="${PROJECT}-ecsTaskExecutionRole"
+
+# -------------------------
+# 1) ECS Services
+# -------------------------
+log "1) Eliminando ECS Services..."
+for svc in "${ECS_SERVICES[@]}"; do
+  if awsq ecs describe-services --cluster "$CLUSTER_NAME" --services "$svc" --query "services[0].status" --output text 2>/dev/null | grep -vq "None"; then
+    log " - Service: $svc => scale 0"
+    awsq ecs update-service --cluster "$CLUSTER_NAME" --service "$svc" --desired-count 0 >/dev/null 2>&1 || true
+    log " - Service: $svc => delete"
+    awsq ecs delete-service --cluster "$CLUSTER_NAME" --service "$svc" --force >/dev/null 2>&1 || true
   else
-    "$@" >/dev/null 2>&1 || true
+    ok " - Service no existe: $svc"
   fi
-}
-
-# Obtener valor del state file
-state_get() { 
-  local value
-  value="$(jq -r --arg k "$1" '.[$k] // empty' "$STATE_FILE" 2>/dev/null || true)"
-  # Limpiar saltos de línea y espacios
-  echo "$value" | tr -d '\n\r' | xargs || true
-}
-
-# Cargar TODAS las variables del state file
-load_state_vars() {
-  step "Cargando variables desde state file..."
-  
-  # VPC y networking
-  VPC_ID="$(state_get VPC_ID)"
-  IGW_ID="$(state_get IGW_ID)"
-  PUB1_ID="$(state_get PUB1_ID)"
-  PUB2_ID="$(state_get PUB2_ID)"
-  PRI1_ID="$(state_get PRI1_ID)"
-  PRI2_ID="$(state_get PRI2_ID)"
-  RTB_PUB_ID="$(state_get RTB_PUB_ID)"
-  RTB_PRI_ID="$(state_get RTB_PRI_ID)"
-  
-  # NAT
-  NAT_GW_ID="$(state_get NAT_GW_ID)"
-  NAT_EIP_ALLOC_ID="$(state_get NAT_EIP_ALLOC_ID)"
-  
-  # Security Groups
-  SG_ALB_ID="$(state_get SG_ALB_ID)"
-  SG_ECS_PRIVATE_ID="$(state_get SG_ECS_PRIVATE_ID)"
-  SG_CONFIG_ID="$(state_get SG_CONFIG_ID)"
-  SG_VPCE_ID="$(state_get SG_VPCE_ID)"
-  SG_RDS_ID="$(state_get SG_RDS_ID | grep -o 'sg-[a-f0-9]\+' | head -1)"
-  
-  # IAM
-  ROLE_ARN="$(state_get ROLE_ARN)"
-  ROLE_NAME="$(basename "$ROLE_ARN" 2>/dev/null || echo "${PROJECT}-ecsTaskExecutionRole")"
-  
-  # Log Groups
-  LG_CONFIG="$(state_get LG_CONFIG)"
-  LG_EUREKA="$(state_get LG_EUREKA)"
-  LG_GATEWAY="$(state_get LG_GATEWAY)"
-  LG_PRODUCTS="$(state_get LG_PRODUCTS)"
-  LG_ORDERS="$(state_get LG_ORDERS)"
-  LG_PAY="$(state_get LG_PAY)"
-  LG_USERS="$(state_get LG_USERS)"
-  
-  # Cloud Map
-  NS_ID="$(state_get NS_ID)"
-  SD_CONFIG_ID="$(state_get SD_CONFIG_ID)"
-  SD_EUREKA_ID="$(state_get SD_EUREKA_ID)"
-  SD_GATEWAY_ID="$(state_get SD_GATEWAY_ID)"
-  SD_PRODUCTS_ID="$(state_get SD_PRODUCTS_ID)"
-  SD_ORDERS_ID="$(state_get SD_ORDERS_ID)"
-  SD_PAY_ID="$(state_get SD_PAY_ID)"
-  SD_USERS_ID="$(state_get SD_USERS_ID)"
-  
-  # ALB
-  ALB_ARN="$(state_get ALB_ARN)"
-  ALB_DNS="$(state_get ALB_DNS)"
-  TG_GW_ARN="$(state_get TG_GW_ARN)"
-  LISTENER_ARN_80="$(state_get LISTENER_ARN_80)"
-  LISTENER_ARN_443="$(state_get LISTENER_ARN_443)"
-  
-  # Task Definitions
-  TD_CONFIG_ARN="$(state_get TD_CONFIG_ARN)"
-  TD_EUREKA_ARN="$(state_get TD_EUREKA_ARN)"
-  TD_GATEWAY_ARN="$(state_get TD_GATEWAY_ARN)"
-  TD_PRODUCTS_ARN="$(state_get TD_PRODUCTS_ARN)"
-  TD_ORDERS_ARN="$(state_get TD_ORDERS_ARN)"
-  TD_PAY_ARN="$(state_get TD_PAY_ARN)"
-  TD_USERS_ARN="$(state_get TD_USERS_ARN)"
-  
-  # Nombres derivados
-  CLUSTER_NAME="${PROJECT}-cluster"
-  NAMESPACE_NAME="${PROJECT}.local"
-  
-  # Array de servicios
-  SERVICES=(
-    "configservice"
-    "eurekaservice"
-    "gatewayservice"
-    "productservice"
-    "orderservice"
-    "paymentservice"
-    "userservice"
-  )
-  
-  # Array de log groups
-  LOG_GROUPS=(
-    "$LG_CONFIG"
-    "$LG_EUREKA"
-    "$LG_GATEWAY"
-    "$LG_PRODUCTS"
-    "$LG_ORDERS"
-    "$LG_PAY"
-    "$LG_USERS"
-  )
-  
-  # Array de Cloud Map services
-  SD_IDS=(
-    "$SD_CONFIG_ID"
-    "$SD_EUREKA_ID"
-    "$SD_GATEWAY_ID"
-    "$SD_PRODUCTS_ID"
-    "$SD_ORDERS_ID"
-    "$SD_PAY_ID"
-    "$SD_USERS_ID"
-  )
-  
-  # Array de Security Groups
-  SGS=(
-    "$SG_ALB_ID"
-    "$SG_ECS_PRIVATE_ID"
-    "$SG_CONFIG_ID"
-    "$SG_VPCE_ID"
-    "$SG_RDS_ID"
-  )
-  
-  # Array de subnets
-  SUBNETS=(
-    "$PUB1_ID"
-    "$PUB2_ID"
-    "$PRI1_ID"
-    "$PRI2_ID"
-  )
-  
-  # Array de task definitions
-  TD_ARNS=(
-    "$TD_CONFIG_ARN"
-    "$TD_EUREKA_ARN"
-    "$TD_GATEWAY_ARN"
-    "$TD_PRODUCTS_ARN"
-    "$TD_ORDERS_ARN"
-    "$TD_PAY_ARN"
-    "$TD_USERS_ARN"
-  )
-  
-  ok "Variables cargadas"
-}
-
-# Mostrar resumen de lo que se eliminará
-show_summary() {
-  echo ""
-  echo "========================================="
-  echo "     📋 RESUMEN DE RECURSOS A ELIMINAR"
-  echo "========================================="
-  
-  [[ -n "$VPC_ID" ]] && echo "  • VPC: $VPC_ID"
-  [[ -n "$ALB_ARN" ]] && echo "  • ALB: $(basename "$ALB_ARN")"
-  [[ -n "$CLUSTER_NAME" ]] && echo "  • Cluster ECS: $CLUSTER_NAME"
-  [[ -n "$NAT_GW_ID" ]] && echo "  • NAT Gateway: $NAT_GW_ID"
-  
-  echo ""
-  echo "  Servicios ECS: ${#SERVICES[@]}"
-  echo "  Security Groups: $(printf '%s\n' "${SGS[@]}" | grep -v '^$' | wc -l)"
-  echo "  Subnets: $(printf '%s\n' "${SUBNETS[@]}" | grep -v '^$' | wc -l)"
-  echo "  Cloud Map Services: $(printf '%s\n' "${SD_IDS[@]}" | grep -v '^$' | wc -l)"
-  echo "  Log Groups: $(printf '%s\n' "${LOG_GROUPS[@]}" | grep -v '^$' | wc -l)"
-  
-  if [[ "$DESTROY_ECR" == "true" ]]; then
-    echo "  ⚠️  ECR Repos: 7 (se eliminarán)"
-  fi
-  if [[ "$DESTROY_IAM" == "true" ]]; then
-    echo "  ⚠️  IAM Role: $ROLE_NAME (se eliminará)"
-  fi
-  if [[ "$DESTROY_RDS" == "true" ]]; then
-    echo "  ⚠️  RDS: Se eliminará (si existe)"
-  fi
-  
-  echo "========================================="
-}
-
-# Confirmar destrucción
-confirm_destroy() {
-  if [[ "$FORCE_DESTROY" == "true" ]]; then
-    warn "Modo FORCE activado - procediendo sin confirmación"
-    return 0
-  fi
-  
-  if [[ "$DRY_RUN" == "true" ]]; then
-    dry "Modo DRY-RUN activado - no se eliminará nada realmente"
-    return 0
-  fi
-  
-  echo ""
-  read -p "⚠️  ¿Estás SEGURO de querer eliminar TODOS estos recursos? (escribe 'BORRAR' para confirmar): " confirm
-  if [[ "$confirm" != "BORRAR" ]]; then
-    error "Operación cancelada"
-    exit 1
-  fi
-}
-
-# Verificar si un servicio ECS existe
-ecs_service_exists() {
-  local svc="$1"
-  local status
-  status="$(awsq ecs describe-services --cluster "$CLUSTER_NAME" --services "$svc" \
-    --query "services[0].status" --output text 2>/dev/null || true)"
-  [[ "$status" != "None" && -n "$status" ]]
-}
-
-# Esperar a que servicio esté INACTIVE
-wait_services_inactive() {
-  local svc="$1"
-  log "Esperando que $svc esté INACTIVE..."
-  for i in {1..60}; do
-    local st
-    st="$(awsq ecs describe-services --cluster "$CLUSTER_NAME" --services "$svc" \
-      --query "services[0].status" --output text 2>/dev/null || true)"
-    if [[ "$st" == "INACTIVE" || "$st" == "None" || -z "$st" ]]; then
-      ok "$svc eliminado"
-      return 0
-    fi
-    echo -n "."
-    sleep 5
-  done
-  echo ""
-  warn "Timeout esperando INACTIVE: $svc (continúo igual)"
-}
-
-# Obtener namespace ID por nombre
-get_namespace_id_by_name() {
-  awsq servicediscovery list-namespaces \
-    --query "Namespaces[?Name=='${NAMESPACE_NAME}'].Id | [0]" --output text 2>/dev/null | grep -v "None" || true
-}
-
-# Deregistrar task definitions de una familia
-deregister_task_family() {
-  local td_arn="$1"
-  local name="$2"
-  
-  if [[ -z "$td_arn" || "$td_arn" == "null" ]]; then
-    return
-  fi
-  
-  local family="$(echo "$td_arn" | cut -d'/' -f2 | cut -d':' -f1)"
-  if [[ -n "$family" ]]; then
-    log "Deregistrando task definitions de: $family"
-    local revisions
-    revisions="$(awsq ecs list-task-definitions --family-prefix "$family" --query "taskDefinitionArns[]" --output text 2>/dev/null || true)"
-    if [[ -n "$revisions" ]]; then
-      for rev in $revisions; do
-        safe_dry awsq ecs deregister-task-definition --task-definition "$rev"
-      done
-    fi
-  fi
-}
-
-# Esperar a que NAT se elimine
-wait_nat_deleted() {
-  local nat_id="$1"
-  log "Esperando eliminación de NAT Gateway..."
-  for i in {1..60}; do
-    local state
-    state="$(awsq ec2 describe-nat-gateways --nat-gateway-ids "$nat_id" \
-      --query "NatGateways[0].State" --output text 2>/dev/null || echo "deleted")"
-    if [[ "$state" == "deleted" || "$state" == "None" ]]; then
-      ok "NAT Gateway eliminado"
-      return 0
-    fi
-    echo -n "."
-    sleep 5
-  done
-  echo ""
-  warn "Timeout esperando NAT deletion"
-}
-
-# Esperar a que ALB se elimine
-wait_alb_deleted() {
-  local alb_arn="$1"
-  log "Esperando eliminación de ALB..."
-  for i in {1..60}; do
-    if ! awsq elbv2 describe-load-balancers --load-balancer-arns "$alb_arn" 2>/dev/null; then
-      ok "ALB eliminado"
-      return 0
-    fi
-    echo -n "."
-    sleep 5
-  done
-  echo ""
-  warn "Timeout esperando ALB deletion"
-}
-
-# -----------------------------
-# MAIN DESTROY SEQUENCE
-# -----------------------------
-main() {
-  echo ""
-  echo "🔥 SCRIPT DE DESTRUCCIÓN MEJORADO"
-  echo "=================================="
-  
-  # Cargar variables
-  load_state_vars
-  
-  # Mostrar resumen
-  show_summary
-  
-  # Confirmar (si no es dry-run)
-  confirm_destroy
-  
-  echo ""
-  
-  # -----------------------------
-  # 1) ESCALAR SERVICIOS A 0
-  # -----------------------------
-  step "1) Escalando servicios ECS a 0..."
-  for s in "${SERVICES[@]}"; do
-    if ecs_service_exists "$s"; then
-      log "Escalando a 0: $s"
-      safe_dry awsq ecs update-service --cluster "$CLUSTER_NAME" --service "$s" --desired-count 0
-    else
-      ok "Servicio no existe: $s"
-    fi
-  done
-  
-  # Pequeña pausa para que el escalado se propague
-  sleep 10
-  
-  # -----------------------------
-  # 2) ELIMINAR SERVICIOS ECS
-  # -----------------------------
-  step "2) Eliminando servicios ECS..."
-  for s in "${SERVICES[@]}"; do
-    if ecs_service_exists "$s"; then
-      log "Eliminando: $s"
-      safe_dry awsq ecs delete-service --cluster "$CLUSTER_NAME" --service "$s" --force
-      wait_services_inactive "$s"
-    fi
-  done
-  
-  # -----------------------------
-  # 3) DEREGISTRAR TASK DEFINITIONS
-  # -----------------------------
-  step "3) Deregistrando task definitions..."
-  local td_index=0
-  for td in "${TD_ARNS[@]}"; do
-    if [[ -n "$td" && "$td" != "null" ]]; then
-      local svc_name="${SERVICES[$td_index]:-unknown}"
-      deregister_task_family "$td" "$svc_name"
-    fi
-    td_index=$((td_index + 1))
-  done
-  
-  # -----------------------------
-  # 4) ELIMINAR ALB Y TARGET GROUP
-  # -----------------------------
-  step "4) Eliminando ALB y Target Group..."
-  
-  # Eliminar listeners primero
-  if [[ -n "$LISTENER_ARN_80" && "$LISTENER_ARN_80" != "null" ]]; then
-    log "Eliminando listener 80"
-    safe_dry awsq elbv2 delete-listener --listener-arn "$LISTENER_ARN_80"
-  fi
-  
-  if [[ -n "$LISTENER_ARN_443" && "$LISTENER_ARN_443" != "null" ]]; then
-    log "Eliminando listener 443"
-    safe_dry awsq elbv2 delete-listener --listener-arn "$LISTENER_ARN_443"
-  fi
-  
-  # Eliminar ALB
-  if [[ -n "$ALB_ARN" && "$ALB_ARN" != "null" ]]; then
-    log "Eliminando ALB"
-    safe_dry awsq elbv2 delete-load-balancer --load-balancer-arn "$ALB_ARN"
-    wait_alb_deleted "$ALB_ARN"
-  fi
-  
-  # Eliminar Target Group
-  if [[ -n "$TG_GW_ARN" && "$TG_GW_ARN" != "null" ]]; then
-    log "Eliminando Target Group"
-    safe_dry awsq elbv2 delete-target-group --target-group-arn "$TG_GW_ARN"
-  fi
-  
-  # -----------------------------
-  # 5) ELIMINAR CLOUD MAP
-  # -----------------------------
-  step "5) Eliminando Cloud Map..."
-  
-  # Eliminar servicios Cloud Map
-  for sid in "${SD_IDS[@]}"; do
-    if [[ -n "$sid" && "$sid" != "null" ]]; then
-      log "Eliminando Cloud Map service: $sid"
-      safe_dry awsq servicediscovery delete-service --id "$sid"
-    fi
-  done
-  
-  # Pequeña pausa para que se eliminen los servicios
-  sleep 10
-  
-  # Eliminar namespace
-  NS_ID_TO_DELETE="$NS_ID"
-  if [[ -z "$NS_ID_TO_DELETE" || "$NS_ID_TO_DELETE" == "null" ]]; then
-    NS_ID_TO_DELETE="$(get_namespace_id_by_name)"
-  fi
-  
-  if [[ -n "$NS_ID_TO_DELETE" && "$NS_ID_TO_DELETE" != "null" ]]; then
-    log "Eliminando namespace: $NS_ID_TO_DELETE"
-    safe_dry awsq servicediscovery delete-namespace --id "$NS_ID_TO_DELETE"
-  fi
-  
-  # -----------------------------
-  # 6) ELIMINAR CLUSTER ECS
-  # -----------------------------
-  step "6) Eliminando cluster ECS..."
-  safe_dry awsq ecs delete-cluster --cluster "$CLUSTER_NAME"
-  
-  # -----------------------------
-  # 7) ELIMINAR LOG GROUPS
-  # -----------------------------
-  step "7) Eliminando CloudWatch Log Groups..."
-  for lg in "${LOG_GROUPS[@]}"; do
-    if [[ -n "$lg" && "$lg" != "null" ]]; then
-      log "Eliminando log group: $lg"
-      safe_dry awsq logs delete-log-group --log-group-name "$lg"
-    fi
-  done
-  
-  # -----------------------------
-  # 8) ELIMINAR VPC ENDPOINTS
-  # -----------------------------
-  step "8) Eliminando VPC Endpoints..."
-  if [[ -n "$VPC_ID" && "$VPC_ID" != "null" ]]; then
-    EP_IDS="$(awsq ec2 describe-vpc-endpoints --filters "Name=vpc-id,Values=$VPC_ID" \
-      --query "VpcEndpoints[].VpcEndpointId" --output text 2>/dev/null || true)"
-    if [[ -n "${EP_IDS// }" ]]; then
-      log "Eliminando VPC endpoints: $EP_IDS"
-      safe_dry awsq ec2 delete-vpc-endpoints --vpc-endpoint-ids $EP_IDS
-    fi
-  fi
-  
-  # -----------------------------
-  # 9) ELIMINAR NAT GATEWAY
-  # -----------------------------
-  if [[ -n "$NAT_GW_ID" && "$NAT_GW_ID" != "null" ]]; then
-    step "9) Eliminando NAT Gateway..."
-    log "Eliminando NAT Gateway: $NAT_GW_ID"
-    safe_dry awsq ec2 delete-nat-gateway --nat-gateway-id "$NAT_GW_ID"
-    wait_nat_deleted "$NAT_GW_ID"
-  fi
-  
-  # -----------------------------
-  # 10) LIBERAR ELASTIC IP
-  # -----------------------------
-  if [[ "$DESTROY_EIP" == "true" && -n "$NAT_EIP_ALLOC_ID" && "$NAT_EIP_ALLOC_ID" != "null" ]]; then
-    step "10) Liberando Elastic IP..."
-    log "Liberando EIP: $NAT_EIP_ALLOC_ID"
-    safe_dry awsq ec2 release-address --allocation-id "$NAT_EIP_ALLOC_ID"
-  fi
-  
-  # -----------------------------
-  # 11) ELIMINAR SECURITY GROUPS
-  # -----------------------------
-  step "11) Eliminando Security Groups..."
-  for sg in "${SGS[@]}"; do
-    if [[ -n "$sg" && "$sg" != "null" ]]; then
-      log "Eliminando Security Group: $sg"
-      safe_dry awsq ec2 delete-security-group --group-id "$sg"
-      sleep 2
-    fi
-  done
-  
-  # -----------------------------
-  # 12) ELIMINAR SUBNETS
-  # -----------------------------
-  step "12) Eliminando Subnets..."
-  for sn in "${SUBNETS[@]}"; do
-    if [[ -n "$sn" && "$sn" != "null" ]]; then
-      log "Eliminando Subnet: $sn"
-      safe_dry awsq ec2 delete-subnet --subnet-id "$sn"
-      sleep 2
-    fi
-  done
-  
-  # -----------------------------
-  # 13) ELIMINAR ROUTE TABLES
-  # -----------------------------
-  step "13) Eliminando Route Tables..."
-  
-  # Desasociar route tables primero
-  for rtb in "$RTB_PUB_ID" "$RTB_PRI_ID"; do
-    if [[ -n "$rtb" && "$rtb" != "null" ]]; then
-      ASSOCS="$(awsq ec2 describe-route-tables --route-table-ids "$rtb" \
-        --query "RouteTables[0].Associations[?Main==\`false\`].RouteTableAssociationId" --output text 2>/dev/null || true)"
-      for a in $ASSOCS; do
-        safe_dry awsq ec2 disassociate-route-table --association-id "$a"
-      done
-    fi
-  done
-  
-  # Eliminar route tables
-  [[ -n "$RTB_PUB_ID" && "$RTB_PUB_ID" != "null" ]] && { 
-    log "Eliminando Route Table pública: $RTB_PUB_ID"
-    safe_dry awsq ec2 delete-route-table --route-table-id "$RTB_PUB_ID"
-  }
-  
-  [[ -n "$RTB_PRI_ID" && "$RTB_PRI_ID" != "null" ]] && { 
-    log "Eliminando Route Table privada: $RTB_PRI_ID"
-    safe_dry awsq ec2 delete-route-table --route-table-id "$RTB_PRI_ID"
-  }
-  
-  # -----------------------------
-  # 14) ELIMINAR INTERNET GATEWAY
-  # -----------------------------
-  step "14) Eliminando Internet Gateway..."
-  if [[ -n "$IGW_ID" && "$IGW_ID" != "null" && -n "$VPC_ID" && "$VPC_ID" != "null" ]]; then
-    log "Desadjuntando IGW: $IGW_ID"
-    safe_dry awsq ec2 detach-internet-gateway --internet-gateway-id "$IGW_ID" --vpc-id "$VPC_ID"
-    log "Eliminando IGW: $IGW_ID"
-    safe_dry awsq ec2 delete-internet-gateway --internet-gateway-id "$IGW_ID"
-  fi
-  
-  # -----------------------------
-  # 15) ELIMINAR VPC
-  # -----------------------------
-  step "15) Eliminando VPC..."
-  if [[ -n "$VPC_ID" && "$VPC_ID" != "null" ]]; then
-    log "Eliminando VPC: $VPC_ID"
-    safe_dry awsq ec2 delete-vpc --vpc-id "$VPC_ID"
-  fi
-  
-  # -----------------------------
-  # 16) ELIMINAR ECR (opcional)
-  # -----------------------------
-  if [[ "$DESTROY_ECR" == "true" ]]; then
-    step "16) Eliminando ECR repositories..."
-    ACCOUNT_ID="$(awsq sts get-caller-identity --query Account --output text)"
-    for repo in configservice eurekaservice gatewayservice productservice orderservice paymentservice userservice; do
-      log "Eliminando ECR repo: $repo"
-      safe_dry awsq ecr delete-repository --repository-name "$repo" --force
-    done
-  else
-    warn "16) DESTROY_ECR=false - conservando ECR repos"
-  fi
-  
-  # -----------------------------
-  # 17) ELIMINAR IAM ROLE (opcional)
-  # -----------------------------
-  if [[ "$DESTROY_IAM" == "true" && -n "$ROLE_NAME" ]]; then
-    step "17) Eliminando IAM Role..."
-    log "Desadjuntando políticas de: $ROLE_NAME"
-    safe_dry aws iam detach-role-policy --role-name "$ROLE_NAME" \
-      --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
-    log "Eliminando role: $ROLE_NAME"
-    safe_dry aws iam delete-role --role-name "$ROLE_NAME"
-  else
-    warn "17) DESTROY_IAM=false - conservando IAM role"
-  fi
-  
-  # -----------------------------
-  # 18) ELIMINAR RDS (opcional)
-  # -----------------------------
-  if [[ "$DESTROY_RDS" == "true" ]]; then
-    step "18) Eliminando RDS..."
-    DB_INSTANCE_ID="${PROJECT}-mysql"
-    
-    log "Desactivando deletion protection para: $DB_INSTANCE_ID"
-    safe_dry awsq rds modify-db-instance --db-instance-identifier "$DB_INSTANCE_ID" \
-      --no-deletion-protection --apply-immediately
-    
-    log "Eliminando RDS instance: $DB_INSTANCE_ID"
-    safe_dry awsq rds delete-db-instance --db-instance-identifier "$DB_INSTANCE_ID" \
-      --skip-final-snapshot --delete-automated-backups
-  else
-    warn "18) DESTROY_RDS=false - conservando RDS"
-  fi
-  
-  # -----------------------------
-  # 19) BACKUP DEL STATE FILE
-  # -----------------------------
-  if [[ "$DRY_RUN" != "true" ]]; then
-    step "19) Respaldando state file..."
-    BACKUP_FILE="${STATE_FILE}.backup.$(date +%Y%m%d-%H%M%S)"
-    cp "$STATE_FILE" "$BACKUP_FILE"
-    ok "State file respaldado en: $BACKUP_FILE"
-    
-    # Preguntar si eliminar el state file original
-    if [[ "$FORCE_DESTROY" != "true" ]]; then
-      read -p "¿Eliminar el state file original? (s/N): " delete_state
-      if [[ "$delete_state" =~ ^[Ss]$ ]]; then
-        rm "$STATE_FILE"
-        ok "State file eliminado"
-      fi
-    fi
-  fi
-  
-  echo ""
-  ok "🎉 PROCESO DE DESTRUCCIÓN COMPLETADO"
-  if [[ "$DRY_RUN" == "true" ]]; then
-    warn "Modo DRY-RUN - no se eliminó nada realmente"
-  fi
-}
-
-# Procesar argumentos de línea de comandos
-while [[ $# -gt 0 ]]; do
-  case $1 in
-    --force)
-      FORCE_DESTROY=true
-      shift
-      ;;
-    --dry-run)
-      DRY_RUN=true
-      shift
-      ;;
-    --destroy-ecr)
-      DESTROY_ECR=true
-      shift
-      ;;
-    --destroy-iam)
-      DESTROY_IAM=true
-      shift
-      ;;
-    --destroy-rds)
-      DESTROY_RDS=true
-      shift
-      ;;
-    --help)
-      echo "Uso: $0 [opciones]"
-      echo "  --force       Modo no interactivo (no pide confirmación)"
-      echo "  --dry-run     Solo muestra lo que se eliminaría (no ejecuta)"
-      echo "  --destroy-ecr Elimina también los repositorios ECR"
-      echo "  --destroy-iam Elimina también el IAM role"
-      echo "  --destroy-rds Elimina también la base de datos RDS"
-      exit 0
-      ;;
-    *)
-      error "Opción desconocida: $1"
-      exit 1
-      ;;
-  esac
 done
+log "Esperando INACTIVE..."
+for svc in "${ECS_SERVICES[@]}"; do
+  for _i in {1..40}; do
+    st="$(awsq ecs describe-services --cluster "$CLUSTER_NAME" --services "$svc" --query "services[0].status" --output text 2>/dev/null || true)"
+    [[ "$st" == "INACTIVE" || "$st" == "None" || -z "$st" ]] && break
+    sleep 3
+  done
+done
+ok "ECS Services: OK"
+echo ""
 
-# Ejecutar main
-main
+# -------------------------
+# 2) ALB + listeners + TG
+# -------------------------
+log "2) Eliminando ALB/Listeners/TargetGroup..."
+if [[ -n "${ALB_ARN:-}" && "$ALB_ARN" != "null" ]]; then
+  LST_JSON="$(awsq elbv2 describe-listeners --load-balancer-arn "$ALB_ARN" --output json 2>/dev/null || echo '{}')"
+  echo "$LST_JSON" | jq -r '.Listeners[]?.ListenerArn' | while read -r larn; do
+    [[ -z "$larn" || "$larn" == "null" ]] && continue
+    log " - Deleting listener: $larn"
+    awsq elbv2 delete-listener --listener-arn "$larn" >/dev/null 2>&1 || true
+  done
+  log " - Deleting load balancer: $ALB_ARN"
+  awsq elbv2 delete-load-balancer --load-balancer-arn "$ALB_ARN" >/dev/null 2>&1 || true
+  log " - Waiting ALB deleted..."
+  for _i in {1..60}; do
+    exists="$(awsq elbv2 describe-load-balancers --load-balancer-arns "$ALB_ARN" --query 'LoadBalancers[0].LoadBalancerArn' --output text 2>/dev/null || true)"
+    [[ -z "$exists" || "$exists" == "None" ]] && break
+    sleep 5
+  done
+else
+  ok " - ALB no encontrado"
+fi
+
+if [[ -n "${TG_GW_ARN:-}" && "$TG_GW_ARN" != "null" ]]; then
+  log " - Deleting target group: $TG_GW_ARN"
+  awsq elbv2 delete-target-group --target-group-arn "$TG_GW_ARN" >/dev/null 2>&1 || true
+else
+  ok " - TargetGroup no encontrado"
+fi
+ok "ALB/TG: OK"
+echo ""
+
+# -------------------------
+# 3) Cloud Map
+# -------------------------
+log "3) Eliminando Cloud Map (services + namespace)..."
+NS_ID="$(sanitize_token "$(state_get NS_ID)")"
+if [[ -z "$NS_ID" || "$NS_ID" == "null" ]]; then
+  NS_ID="$(awsq servicediscovery list-namespaces --query "Namespaces[?Name=='${NAMESPACE_NAME}'].Id | [0]" --output text 2>/dev/null | grep -v "None" || true)"
+fi
+
+if [[ -n "${NS_ID:-}" && "$NS_ID" != "null" ]]; then
+  SRV_JSON="$(awsq servicediscovery list-services --output json 2>/dev/null || echo '{"Services":[]}')"
+  echo "$SRV_JSON" | jq -r --arg ns "$NS_ID" '.Services[] | select(.NamespaceId==$ns) | .Id' | while read -r sid; do
+    [[ -z "$sid" || "$sid" == "null" ]] && continue
+    log " - Deleting CloudMap service: $sid"
+    awsq servicediscovery delete-service --id "$sid" >/dev/null 2>&1 || true
+  done
+
+  log " - Deleting namespace: $NS_ID"
+  OP_ID="$(awsq servicediscovery delete-namespace --id "$NS_ID" --query OperationId --output text 2>/dev/null || true)"
+  if [[ -n "${OP_ID:-}" && "$OP_ID" != "null" ]]; then
+    log " - Waiting namespace delete SUCCESS: $OP_ID"
+    for _i in {1..80}; do
+      st="$(awsq servicediscovery get-operation --operation-id "$OP_ID" --query "Operation.Status" --output text 2>/dev/null || true)"
+      [[ "$st" == "SUCCESS" ]] && break
+      [[ "$st" == "FAIL" || "$st" == "FAILURE" ]] && { warn "Namespace delete failed"; break; }
+      sleep 3
+    done
+  fi
+else
+  ok " - Namespace no encontrado"
+fi
+ok "Cloud Map: OK"
+echo ""
+
+# -------------------------
+# 4) ECS Cluster
+# -------------------------
+log "4) Eliminando ECS Cluster..."
+awsq ecs delete-cluster --cluster "$CLUSTER_NAME" >/dev/null 2>&1 || true
+ok "Cluster: OK"
+echo ""
+
+# -------------------------
+# 5) Deregister task defs
+# -------------------------
+log "5) Deregister task definitions (best-effort)..."
+FAMS="$(awsq ecs list-task-definition-families --status ACTIVE --query "families[?starts_with(@, '${PROJECT}-td-')]" --output text 2>/dev/null || true)"
+for fam in $FAMS; do
+  ARNS="$(awsq ecs list-task-definitions --family-prefix "$fam" --status ACTIVE --query "taskDefinitionArns[]" --output text 2>/dev/null || true)"
+  for arn in $ARNS; do
+    [[ -z "$arn" ]] && continue
+    log " - Deregister: $arn"
+    awsq ecs deregister-task-definition --task-definition "$arn" >/dev/null 2>&1 || true
+  done
+done
+ok "Task defs: OK"
+echo ""
+
+# -------------------------
+# 6) CloudWatch Logs
+# -------------------------
+log "6) Eliminando CloudWatch Log Groups..."
+LOGS="$(awsq logs describe-log-groups --log-group-name-prefix "/ecs/${PROJECT}/" --query "logGroups[].logGroupName" --output text 2>/dev/null || true)"
+for lg in $LOGS; do
+  [[ -z "$lg" ]] && continue
+  log " - Deleting log group: $lg"
+  awsq logs delete-log-group --log-group-name "$lg" >/dev/null 2>&1 || true
+done
+ok "Logs: OK"
+echo ""
+
+# -------------------------
+# 7) ECR (imágenes + repos) ✅ SIEMPRE
+# -------------------------
+log "7) Eliminando ECR (imágenes + repos)..."
+for repo in "${REPOS[@]}"; do
+  # loop por chunks de 100 hasta vaciar
+  while true; do
+    IMG_JSON="$(awsq ecr list-images --repository-name "$repo" --query 'imageIds' --output json 2>/dev/null || echo '[]')"
+    count="$(echo "$IMG_JSON" | jq 'length')"
+    [[ "$count" -le 0 ]] && break
+
+    log " - Deleting up to 100 images in repo: $repo (quedan: $count)"
+    echo "$IMG_JSON" | jq -c '.[0:100]' > /tmp/imgids_100.json
+    awsq ecr batch-delete-image --repository-name "$repo" --image-ids file:///tmp/imgids_100.json >/dev/null 2>&1 || true
+    rm -f /tmp/imgids_100.json || true
+    sleep 1
+  done
+
+  log " - Deleting repository: $repo"
+  awsq ecr delete-repository --repository-name "$repo" --force >/dev/null 2>&1 || true
+done
+ok "ECR: OK"
+echo ""
+
+# -------------------------
+# 8) ✅ BORRAR BASE DE DATOS (RDS/Aurora)
+# -------------------------
+log "8) Eliminando Base de Datos (RDS/Aurora)..."
+if [[ "$DELETE_DB" == "true" ]]; then
+  # --- Aurora clusters por tags ---
+  CL_JSON="$(awsq rds describe-db-clusters --output json 2>/dev/null || echo '{"DBClusters":[]}')"
+  echo "$CL_JSON" | jq -r --arg p "$PROJECT" --arg e "$ENV_NAME" '
+    .DBClusters[]
+    | select((.DBClusterIdentifier|startswith($p)) or (.TagList? // [] | any(.Key=="Project" and .Value==$p)) )
+    | .DBClusterIdentifier
+  ' | while read -r cid; do
+      [[ -z "$cid" || "$cid" == "null" ]] && continue
+      log " - Deleting Aurora Cluster: $cid"
+
+      # Primero borrar instancias miembro del cluster
+      MEM_JSON="$(awsq rds describe-db-instances --output json 2>/dev/null || echo '{"DBInstances":[]}')"
+      echo "$MEM_JSON" | jq -r --arg cid "$cid" '
+        .DBInstances[]
+        | select(.DBClusterIdentifier==$cid)
+        | .DBInstanceIdentifier
+      ' | while read -r mid; do
+          [[ -z "$mid" || "$mid" == "null" ]] && continue
+          log "   - Deleting cluster member instance: $mid"
+          if [[ "$SKIP_FINAL_SNAPSHOT" == "true" ]]; then
+            awsq rds delete-db-instance --db-instance-identifier "$mid" --skip-final-snapshot >/dev/null 2>&1 || true
+          else
+            snap="${FINAL_SNAPSHOT_PREFIX}-${mid}-$(date +%Y%m%d%H%M%S)"
+            awsq rds delete-db-instance --db-instance-identifier "$mid" --final-db-snapshot-identifier "$snap" >/dev/null 2>&1 || true
+          fi
+      done
+
+      # Esperar a que no existan instancias del cluster
+      log "   - Waiting cluster instances deleted..."
+      for _i in {1..120}; do
+        left="$(awsq rds describe-db-instances --query "DBInstances[?DBClusterIdentifier=='${cid}'] | length(@)" --output text 2>/dev/null || echo "0")"
+        [[ "$left" == "0" ]] && break
+        sleep 10
+      done
+
+      # Borrar cluster
+      if [[ "$SKIP_FINAL_SNAPSHOT" == "true" ]]; then
+        awsq rds delete-db-cluster --db-cluster-identifier "$cid" --skip-final-snapshot >/dev/null 2>&1 || true
+      else
+        snap="${FINAL_SNAPSHOT_PREFIX}-${cid}-$(date +%Y%m%d%H%M%S)"
+        awsq rds delete-db-cluster --db-cluster-identifier "$cid" --final-db-snapshot-identifier "$snap" >/dev/null 2>&1 || true
+      fi
+  done
+
+  # --- RDS instances (no-cluster) por tags/prefijo ---
+  INS_JSON="$(awsq rds describe-db-instances --output json 2>/dev/null || echo '{"DBInstances":[]}')"
+  echo "$INS_JSON" | jq -r --arg p "$PROJECT" '
+    .DBInstances[]
+    | select((.DBClusterIdentifier? // "") == "")
+    | select((.DBInstanceIdentifier|startswith($p)) or (.TagList? // [] | any(.Key=="Project" and .Value==$p)) )
+    | .DBInstanceIdentifier
+  ' | while read -r iid; do
+      [[ -z "$iid" || "$iid" == "null" ]] && continue
+      log " - Deleting RDS Instance: $iid"
+      if [[ "$SKIP_FINAL_SNAPSHOT" == "true" ]]; then
+        awsq rds delete-db-instance --db-instance-identifier "$iid" --skip-final-snapshot >/dev/null 2>&1 || true
+      else
+        snap="${FINAL_SNAPSHOT_PREFIX}-${iid}-$(date +%Y%m%d%H%M%S)"
+        awsq rds delete-db-instance --db-instance-identifier "$iid" --final-db-snapshot-identifier "$snap" >/dev/null 2>&1 || true
+      fi
+  done
+
+  # Esperar que no existan DBs con prefijo del proyecto
+  log " - Waiting RDS/Aurora deleted..."
+  for _i in {1..120}; do
+    left1="$(awsq rds describe-db-instances --query "DBInstances[?starts_with(DBInstanceIdentifier,'${PROJECT}')]|length(@)" --output text 2>/dev/null || echo "0")"
+    left2="$(awsq rds describe-db-clusters  --query "DBClusters[?starts_with(DBClusterIdentifier,'${PROJECT}')]|length(@)" --output text 2>/dev/null || echo "0")"
+    [[ "$left1" == "0" && "$left2" == "0" ]] && break
+    sleep 10
+  done
+
+  # Limpieza subnet groups del proyecto (best-effort)
+  log " - Cleaning DB Subnet Groups (best-effort)..."
+  SNG="$(awsq rds describe-db-subnet-groups --query "DBSubnetGroups[?starts_with(DBSubnetGroupName,'${PROJECT}')].DBSubnetGroupName" --output text 2>/dev/null || true)"
+  for g in $SNG; do
+    [[ -z "$g" ]] && continue
+    log "   - Delete DB subnet group: $g"
+    awsq rds delete-db-subnet-group --db-subnet-group-name "$g" >/dev/null 2>&1 || true
+  done
+
+else
+  ok "DB delete deshabilitado"
+fi
+ok "DB: OK"
+echo ""
+
+# -------------------------
+# 9) IAM role
+# -------------------------
+log "9) Eliminando IAM Role..."
+ROLE_ARN="$(awsq iam get-role --role-name "${PROJECT}-ecsTaskExecutionRole" --query Role.Arn --output text 2>/dev/null || true)"
+if [[ -n "${ROLE_ARN:-}" && "$ROLE_ARN" != "None" ]]; then
+  POLS="$(awsq iam list-attached-role-policies --role-name "${PROJECT}-ecsTaskExecutionRole" --query 'AttachedPolicies[].PolicyArn' --output text 2>/dev/null || true)"
+  for p in $POLS; do
+    [[ -z "$p" ]] && continue
+    log " - Detach policy: $p"
+    awsq iam detach-role-policy --role-name "${PROJECT}-ecsTaskExecutionRole" --policy-arn "$p" >/dev/null 2>&1 || true
+  done
+  log " - Delete role: ${PROJECT}-ecsTaskExecutionRole"
+  awsq iam delete-role --role-name "${PROJECT}-ecsTaskExecutionRole" >/dev/null 2>&1 || true
+else
+  ok " - Role no existe"
+fi
+ok "IAM: OK"
+echo ""
+
+# -------------------------
+# 10) VPC Endpoints
+# -------------------------
+log "10) Eliminando VPC Endpoints..."
+if [[ -n "${VPC_ID:-}" && "$VPC_ID" != "null" ]]; then
+  VPCE_IDS="$(awsq ec2 describe-vpc-endpoints --filters "Name=vpc-id,Values=$VPC_ID" \
+    --query "VpcEndpoints[].VpcEndpointId" --output text 2>/dev/null || true)"
+  for vid in $VPCE_IDS; do
+    [[ -z "$vid" ]] && continue
+    log " - Deleting VPCE: $vid"
+    awsq ec2 delete-vpc-endpoints --vpc-endpoint-ids "$vid" >/dev/null 2>&1 || true
+  done
+fi
+ok "VPCE: OK"
+echo ""
+
+# -------------------------
+# 11) NAT + EIP
+# -------------------------
+log "11) Eliminando NAT (si existe)..."
+if [[ -n "${NAT_GW_ID:-}" && "$NAT_GW_ID" != "null" && "$NAT_GW_ID" != "None" ]]; then
+  log " - Deleting NAT GW: $NAT_GW_ID"
+  awsq ec2 delete-nat-gateway --nat-gateway-id "$NAT_GW_ID" >/dev/null 2>&1 || true
+  log " - Waiting NAT deleted..."
+  for _i in {1..80}; do
+    st="$(awsq ec2 describe-nat-gateways --nat-gateway-ids "$NAT_GW_ID" --query "NatGateways[0].State" --output text 2>/dev/null || true)"
+    [[ "$st" == "deleted" || "$st" == "None" || -z "$st" ]] && break
+    sleep 5
+  done
+fi
+if [[ -n "${NAT_EIP_ALLOC_ID:-}" && "$NAT_EIP_ALLOC_ID" != "null" && "$NAT_EIP_ALLOC_ID" != "None" ]]; then
+  log " - Releasing EIP: $NAT_EIP_ALLOC_ID"
+  awsq ec2 release-address --allocation-id "$NAT_EIP_ALLOC_ID" >/dev/null 2>&1 || true
+fi
+ok "NAT/EIP: OK"
+echo ""
+
+# -------------------------
+# 12) RTBs, Subnets, IGW, SGs, VPC
+# -------------------------
+log "12) Route tables (best-effort)..."
+if [[ -n "${VPC_ID:-}" && "$VPC_ID" != "null" ]]; then
+  RTBS="$(awsq ec2 describe-route-tables --filters "Name=vpc-id,Values=$VPC_ID" --output json 2>/dev/null || echo '{}')"
+  echo "$RTBS" | jq -r '.RouteTables[]?.Associations[]? | select(.Main!=true) | .RouteTableAssociationId' | while read -r assoc; do
+    [[ -z "$assoc" || "$assoc" == "null" ]] && continue
+    log " - Disassociate RTB assoc: $assoc"
+    awsq ec2 disassociate-route-table --association-id "$assoc" >/dev/null 2>&1 || true
+  done
+  for rtb in "$RTB_PUB_ID" "$RTB_PRI_ID"; do
+    [[ -z "${rtb:-}" || "$rtb" == "null" || "$rtb" == "None" ]] && continue
+    log " - Delete RTB: $rtb"
+    awsq ec2 delete-route-table --route-table-id "$rtb" >/dev/null 2>&1 || true
+  done
+fi
+ok "RTBs: OK"
+echo ""
+
+log "13) Eliminando Subnets..."
+for sn in "$PRI1_ID" "$PRI2_ID" "$PUB1_ID" "$PUB2_ID"; do
+  [[ -z "${sn:-}" || "$sn" == "null" || "$sn" == "None" ]] && continue
+  log " - Delete subnet: $sn"
+  awsq ec2 delete-subnet --subnet-id "$sn" >/dev/null 2>&1 || true
+done
+ok "Subnets: OK"
+echo ""
+
+log "14) Eliminando IGW..."
+if [[ -n "${IGW_ID:-}" && "$IGW_ID" != "null" && "$IGW_ID" != "None" && -n "${VPC_ID:-}" && "$VPC_ID" != "null" ]]; then
+  log " - Detach IGW: $IGW_ID"
+  awsq ec2 detach-internet-gateway --internet-gateway-id "$IGW_ID" --vpc-id "$VPC_ID" >/dev/null 2>&1 || true
+  log " - Delete IGW: $IGW_ID"
+  awsq ec2 delete-internet-gateway --internet-gateway-id "$IGW_ID" >/dev/null 2>&1 || true
+fi
+ok "IGW: OK"
+echo ""
+
+log "15) Eliminando Security Groups..."
+for sg in "$SG_VPCE_ID" "$SG_CONFIG_ID" "$SG_ECS_PRIVATE_ID" "$SG_ALB_ID"; do
+  [[ -z "${sg:-}" || "$sg" == "null" || "$sg" == "None" ]] && continue
+  log " - Delete SG: $sg"
+  awsq ec2 delete-security-group --group-id "$sg" >/dev/null 2>&1 || true
+done
+ok "SGs: OK"
+echo ""
+
+log "16) Eliminando VPC..."
+if [[ -n "${VPC_ID:-}" && "$VPC_ID" != "null" && "$VPC_ID" != "None" ]]; then
+  log " - Delete VPC: $VPC_ID"
+  awsq ec2 delete-vpc --vpc-id "$VPC_ID" >/dev/null 2>&1 || true
+fi
+ok "VPC: OK"
+echo ""
+
+log "17) Limpiando archivos locales..."
+if [[ -f "$STATE_FILE" ]]; then
+  rm -f "$STATE_FILE"
+  ok "State file eliminado: $STATE_FILE"
+fi
+
+ok "CLEANUP COMPLETADO ✅"

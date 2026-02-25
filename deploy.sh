@@ -135,6 +135,16 @@ need() { command -v "$1" >/dev/null 2>&1 || { echo "❌ Falta '$1'"; exit 1; }; 
 log() { echo -e "👉 $*" >&2; }
 ok()  { echo -e "✅ $*" >&2; }
 warn(){ echo -e "⚠️  $*" >&2; }
+die() { echo -e "❌ $*" >&2; exit 1; }
+require_nonempty() {
+  local name="$1"
+  local value="${2:-}"
+  value="$(sanitize_token "$value")"
+
+  if [[ -z "$value" || "$value" == "null" || "$value" == "None" ]]; then
+    die "$name está vacío. Revisa Step 7 (Cloud Map)."
+  fi
+}
 
 awsq() { aws --region "$REGION" "$@"; }
 
@@ -143,6 +153,9 @@ state_get() { jq -r --arg k "$1" '.[$k] // empty' "$STATE_FILE" 2>/dev/null || t
 state_set() { local k="$1"; local v="$2"; local tmp; tmp="$(mktemp)"; jq --arg k "$k" --arg v "$v" '.[$k]=$v' "$STATE_FILE" > "$tmp"; mv "$tmp" "$STATE_FILE"; }
 step_done() { state_set "step_${1}" "done"; }
 is_step_done() { [[ "$(state_get "step_${1}")" == "done" ]]; }
+
+# ✅ FIX: limpia outputs contaminados como "srv-xxx return 0"
+sanitize_token() { echo "${1:-}" | awk '{print $1}'; }
 
 on_error() {
   echo ""
@@ -163,11 +176,18 @@ need aws
 need docker
 need jq
 
-[[ -n "$CONFIG_GIT_URI" ]] || { echo "❌ CONFIG_GIT_URI está vacío en .env"; exit 1; }
-[[ -n "$JWT_SECRET" ]]    || { echo "❌ JWT_SECRET está vacío en .env"; exit 1; }
+[[ -n "$CONFIG_GIT_URI" ]] || die "CONFIG_GIT_URI está vacío en .env"
+[[ -n "$JWT_SECRET" ]]    || die "JWT_SECRET está vacío en .env"
 
 if [[ "$ENABLE_HTTPS" == "true" ]]; then
-  [[ -n "$ACM_CERT_ARN" ]] || { echo "❌ ENABLE_HTTPS=true pero ACM_CERT_ARN está vacío"; exit 1; }
+  [[ -n "$ACM_CERT_ARN" ]] || die "ENABLE_HTTPS=true pero ACM_CERT_ARN está vacío"
+fi
+
+# ✅ FIX: si defines DB_ENDPOINT, exige el resto
+if [[ -n "${DB_ENDPOINT:-}" ]]; then
+  [[ -n "${DB_NAME:-}" ]] || die "DB_ENDPOINT definido pero DB_NAME vacío en .env"
+  [[ -n "${DB_USER:-}" ]] || die "DB_ENDPOINT definido pero DB_USER vacío en .env"
+  [[ -n "${DB_PASS:-}" ]] || die "DB_ENDPOINT definido pero DB_PASS vacío en .env"
 fi
 
 state_init
@@ -414,12 +434,6 @@ if ! is_step_done 2; then
   awsq ec2 authorize-security-group-ingress --group-id "$SG_ALB_ID" \
     --ip-permissions '[{"IpProtocol":"tcp","FromPort":80,"ToPort":80,"IpRanges":[{"CidrIp":"0.0.0.0/0"}]}]' >/dev/null 2>&1 || true
 
-  # ALB inbound 443 (si HTTPS)
-  if [[ "$ENABLE_HTTPS" == "true" ]]; then
-    awsq ec2 authorize-security-group-ingress --group-id "$SG_ALB_ID" \
-      --ip-permissions '[{"IpProtocol":"tcp","FromPort":443,"ToPort":443,"IpRanges":[{"CidrIp":"0.0.0.0/0"}]}]' >/dev/null 2>&1 || true
-  fi
-
   # Gateway 8080 desde ALB -> ECS privado
   awsq ec2 authorize-security-group-ingress --group-id "$SG_ECS_PRIVATE_ID" \
     --ip-permissions "[{\"IpProtocol\":\"tcp\",\"FromPort\":${PORT_GATEWAY},\"ToPort\":${PORT_GATEWAY},\"UserIdGroupPairs\":[{\"GroupId\":\"${SG_ALB_ID}\"}]}]" >/dev/null 2>&1 || true
@@ -432,15 +446,12 @@ if ! is_step_done 2; then
   # 🔒 Egress control (recomendado cuando MODE_NO_NAT=true)
   # -------------------------
   if [[ "$MODE_NO_NAT" == "true" ]]; then
-    # 1) Quitar egress ALL (por defecto) para ECS privado
     awsq ec2 revoke-security-group-egress --group-id "$SG_ECS_PRIVATE_ID" \
       --ip-permissions '[{"IpProtocol":"-1","IpRanges":[{"CidrIp":"0.0.0.0/0"}]}]' >/dev/null 2>&1 || true
 
-    # 2) Permitir 443 SOLO hacia VPCE SG (ECR/Logs)
     awsq ec2 authorize-security-group-egress --group-id "$SG_ECS_PRIVATE_ID" \
       --ip-permissions "[{\"IpProtocol\":\"tcp\",\"FromPort\":443,\"ToPort\":443,\"UserIdGroupPairs\":[{\"GroupId\":\"${SG_VPCE_ID}\"}]}]" >/dev/null 2>&1 || true
 
-    # 3) Permitir conexión interna a Config/Eureka/Services (dentro del VPC)
     awsq ec2 authorize-security-group-egress --group-id "$SG_ECS_PRIVATE_ID" \
       --ip-permissions '[{"IpProtocol":"-1","IpRanges":[{"CidrIp":"10.20.0.0/16"}]}]' >/dev/null 2>&1 || true
 
@@ -448,7 +459,6 @@ if ! is_step_done 2; then
   fi
 
   # ConfigService: permitir salida 80/443 (Git clone)
-  # (Revocamos egress ALL primero para que sí sea “solo 80/443”)
   awsq ec2 revoke-security-group-egress --group-id "$SG_CONFIG_ID" \
     --ip-permissions '[{"IpProtocol":"-1","IpRanges":[{"CidrIp":"0.0.0.0/0"}]}]' >/dev/null 2>&1 || true
 
@@ -466,22 +476,18 @@ if ! is_step_done 2; then
   if [[ "$MODE_NO_NAT" == "true" ]]; then
     log "Creando VPC Endpoints (ECR API/DKR, Logs, S3)..."
 
-    # ECR API
     awsq ec2 create-vpc-endpoint --vpc-id "$VPC_ID" \
       --vpc-endpoint-type Interface --service-name "com.amazonaws.${REGION}.ecr.api" \
       --subnet-ids "$PRI1_ID" "$PRI2_ID" --security-group-ids "$SG_VPCE_ID" --private-dns-enabled >/dev/null 2>&1 || true
 
-    # ECR DKR
     awsq ec2 create-vpc-endpoint --vpc-id "$VPC_ID" \
       --vpc-endpoint-type Interface --service-name "com.amazonaws.${REGION}.ecr.dkr" \
       --subnet-ids "$PRI1_ID" "$PRI2_ID" --security-group-ids "$SG_VPCE_ID" --private-dns-enabled >/dev/null 2>&1 || true
 
-    # CloudWatch Logs
     awsq ec2 create-vpc-endpoint --vpc-id "$VPC_ID" \
       --vpc-endpoint-type Interface --service-name "com.amazonaws.${REGION}.logs" \
       --subnet-ids "$PRI1_ID" "$PRI2_ID" --security-group-ids "$SG_VPCE_ID" --private-dns-enabled >/dev/null 2>&1 || true
 
-    # S3 Gateway (necesario para capas de ECR en privadas)
     awsq ec2 create-vpc-endpoint --vpc-id "$VPC_ID" \
       --vpc-endpoint-type Gateway --service-name "com.amazonaws.${REGION}.s3" \
       --route-table-ids "$RTB_PRI_ID" >/dev/null 2>&1 || true
@@ -605,12 +611,13 @@ if ! is_step_done 6; then
 fi
 
 # -------------------------
-# STEP 7) Cloud Map Namespace + Services
+# STEP 7) Cloud Map Namespace + Services  ✅ FIXED
 # -------------------------
 get_namespace_id_by_name() {
   awsq servicediscovery list-namespaces \
     --query "Namespaces[?Name=='${NAMESPACE_NAME}'].Id | [0]" --output text 2>/dev/null | grep -v "None" || true
 }
+
 wait_cloudmap_operation_success() {
   local op_id="$1"
   log "Cloud Map: esperando SUCCESS: $op_id"
@@ -619,69 +626,75 @@ wait_cloudmap_operation_success() {
     status="$(awsq servicediscovery get-operation --operation-id "$op_id" --query "Operation.Status" --output text 2>/dev/null || true)"
     [[ "$status" == "SUCCESS" ]] && return 0
     if [[ "$status" == "FAIL" || "$status" == "FAILURE" ]]; then
-      echo "❌ Cloud Map operation falló: $op_id"
+      warn "Cloud Map operation falló: $op_id"
       awsq servicediscovery get-operation --operation-id "$op_id" --output json || true
       exit 1
     fi
     sleep 2
   done
-  echo "❌ Timeout esperando SUCCESS: $op_id"
+  warn "Timeout esperando SUCCESS: $op_id"
   awsq servicediscovery get-operation --operation-id "$op_id" --output json || true
   exit 1
 }
-get_service_id_by_name_and_namespace() {
-  local svc_name="$1"; local ns_id="$2"
-  local ids
-  ids="$(awsq servicediscovery list-services --query "Services[?Name=='${svc_name}'].Id" --output text 2>/dev/null || true)"
-  [[ -z "${ids// }" ]] && { echo ""; return 0; }
-  for sid in $ids; do
-    local sid_ns
-    sid_ns="$(awsq servicediscovery get-service --id "$sid" --query "Service.NamespaceId" --output text 2>/dev/null || true)"
-    [[ "$sid_ns" == "$ns_id" ]] && { echo "$sid"; return 0; }
-  done
-  echo ""
-}
+
+# ✅ FIX: ensure_sd_service SOLO imprime el ID por stdout, nada más.
 ensure_sd_service() {
-  local svc_name="$1"; local ns_id="$2"; local state_key="$3"
+  local svc_name="$1"
+  local ns_id="$2"
+  local state_key="$3"
+
   local existing_id
-  existing_id="$(state_get "$state_key")"
-  [[ -z "$existing_id" ]] && existing_id="$(get_service_id_by_name_and_namespace "$svc_name" "$ns_id")"
-  if [[ -n "$existing_id" ]]; then
-    ok "Cloud Map service reusado: $svc_name -> $existing_id"
+  existing_id="$(sanitize_token "$(state_get "$state_key")")"
+
+  if [[ -z "$existing_id" || "$existing_id" == "null" ]]; then
+    local services_json
+    services_json="$(awsq servicediscovery list-services --output json 2>/dev/null || echo '{"Services":[]}')"
+    existing_id="$(echo "$services_json" | jq -r --arg name "$svc_name" --arg ns "$ns_id" '
+      .Services[] | select(.Name == $name and .NamespaceId == $ns) | .Id
+    ' | head -1)"
+    existing_id="$(sanitize_token "$existing_id")"
+  fi
+
+  if [[ -n "$existing_id" && "$existing_id" != "null" ]]; then
     state_set "$state_key" "$existing_id"
+    ok "Cloud Map service reusado: $svc_name -> $existing_id"
     echo "$existing_id"
     return 0
   fi
-  log "Cloud Map: creando service: $svc_name"
-  local out rc
-  set +e
-  out="$(awsq servicediscovery create-service \
+
+  log "Creando nuevo Cloud Map service: $svc_name"
+  local service_id
+  service_id="$(awsq servicediscovery create-service \
     --name "$svc_name" \
     --dns-config "NamespaceId=${ns_id},DnsRecords=[{Type=A,TTL=30}],RoutingPolicy=WEIGHTED" \
     --health-check-custom-config FailureThreshold=1 \
-    --query "Service.Id" --output text 2>&1)"
-  rc=$?
-  set -e
-  if [[ $rc -eq 0 ]]; then
-    ok "Cloud Map service creado: $svc_name -> $out"
-      local clean_id
-      clean_id="$(echo "$out" | tr -d '\r' | grep -oE 'srv-[a-z0-9]+' | head -n1 || true)"
-      [[ -n "$clean_id" ]] || { echo "❌ No pude extraer Service.Id de: $out" >&2; exit 1; }
-      state_set "$state_key" "$clean_id"
-      echo "$clean_id"    return 0
-  fi
-  if echo "$out" | grep -q "ServiceAlreadyExists"; then
-    local id2
-    id2="$(get_service_id_by_name_and_namespace "$svc_name" "$ns_id")"
-    [[ -n "$id2" ]] || { echo "❌ AlreadyExists pero no encontré ID para $svc_name"; exit 1; }
-    ok "Cloud Map service reusado (AlreadyExists): $svc_name -> $id2"
-    state_set "$state_key" "$id2"
-    echo "$id2"
+    --output text \
+    --query 'Service.Id' 2>/dev/null || true)"
+  service_id="$(sanitize_token "$(echo "$service_id" | tr -d '\n\r' | xargs)")"
+
+  if [[ -n "$service_id" && "$service_id" =~ ^srv-[a-z0-9]+$ ]]; then
+    state_set "$state_key" "$service_id"
+    ok "Cloud Map service creado: $svc_name -> $service_id"
+    echo "$service_id"
     return 0
   fi
-  echo "❌ Error creando Cloud Map service '$svc_name':"
-  echo "$out"
-  exit 1
+
+  # fallback: re-list
+  local services_json
+  services_json="$(awsq servicediscovery list-services --output json 2>/dev/null || echo '{"Services":[]}')"
+  service_id="$(echo "$services_json" | jq -r --arg name "$svc_name" --arg ns "$ns_id" '
+    .Services[] | select(.Name == $name and .NamespaceId == $ns) | .Id
+  ' | head -1)"
+  service_id="$(sanitize_token "$service_id")"
+
+  if [[ -n "$service_id" && "$service_id" != "null" ]]; then
+    state_set "$state_key" "$service_id"
+    ok "Cloud Map service reusado (post-check): $svc_name -> $service_id"
+    echo "$service_id"
+    return 0
+  fi
+
+  die "Error creando/obteniendo Cloud Map service '$svc_name' (revisa permisos/namespace)."
 }
 
 if ! is_step_done 7; then
@@ -697,31 +710,32 @@ if ! is_step_done 7; then
       --query "OperationId" --output text)"
     wait_cloudmap_operation_success "$OP_ID"
     NS_ID="$(get_namespace_id_by_name)"
-    [[ -n "$NS_ID" ]] || { echo "❌ No pude resolver NamespaceId"; exit 1; }
+    [[ -n "$NS_ID" ]] || die "No pude resolver NamespaceId"
     ok "Namespace creado: $NS_ID"
   else
     ok "Namespace reusado: $NS_ID"
   fi
   state_set NS_ID "$NS_ID"
 
-  state_set SD_CONFIG_ID  "$(ensure_sd_service "$SVC_CONFIG"  "$NS_ID" "SD_CONFIG_ID")"
-  state_set SD_EUREKA_ID  "$(ensure_sd_service "$SVC_EUREKA"  "$NS_ID" "SD_EUREKA_ID")"
-  state_set SD_GATEWAY_ID "$(ensure_sd_service "$SVC_GATEWAY" "$NS_ID" "SD_GATEWAY_ID")"
-  state_set SD_PRODUCTS_ID "$(ensure_sd_service "$SVC_PRODUCTS" "$NS_ID" "SD_PRODUCTS_ID")"
-  state_set SD_ORDERS_ID   "$(ensure_sd_service "$SVC_ORDERS"   "$NS_ID" "SD_ORDERS_ID")"
-  state_set SD_PAY_ID      "$(ensure_sd_service "$SVC_PAY"      "$NS_ID" "SD_PAY_ID")"
-  state_set SD_USERS_ID    "$(ensure_sd_service "$SVC_USERS"    "$NS_ID" "SD_USERS_ID")"
+  # ✅ FIX: guardamos SIEMPRE limpio
+  state_set SD_CONFIG_ID   "$(ensure_sd_service "$SVC_CONFIG"   "$NS_ID" "SD_CONFIG_ID"   | awk '{print $1}')"
+  state_set SD_EUREKA_ID   "$(ensure_sd_service "$SVC_EUREKA"   "$NS_ID" "SD_EUREKA_ID"   | awk '{print $1}')"
+  state_set SD_GATEWAY_ID  "$(ensure_sd_service "$SVC_GATEWAY"  "$NS_ID" "SD_GATEWAY_ID"  | awk '{print $1}')"
+  state_set SD_PRODUCTS_ID "$(ensure_sd_service "$SVC_PRODUCTS" "$NS_ID" "SD_PRODUCTS_ID" | awk '{print $1}')"
+  state_set SD_ORDERS_ID   "$(ensure_sd_service "$SVC_ORDERS"   "$NS_ID" "SD_ORDERS_ID"   | awk '{print $1}')"
+  state_set SD_PAY_ID      "$(ensure_sd_service "$SVC_PAY"      "$NS_ID" "SD_PAY_ID"      | awk '{print $1}')"
+  state_set SD_USERS_ID    "$(ensure_sd_service "$SVC_USERS"    "$NS_ID" "SD_USERS_ID"    | awk '{print $1}')"
 
   step_done 7
 fi
 
-SD_CONFIG_ID="$(state_get SD_CONFIG_ID)"
-SD_EUREKA_ID="$(state_get SD_EUREKA_ID)"
-SD_GATEWAY_ID="$(state_get SD_GATEWAY_ID)"
-SD_PRODUCTS_ID="$(state_get SD_PRODUCTS_ID)"
-SD_ORDERS_ID="$(state_get SD_ORDERS_ID)"
-SD_PAY_ID="$(state_get SD_PAY_ID)"
-SD_USERS_ID="$(state_get SD_USERS_ID)"
+SD_CONFIG_ID="$(sanitize_token "$(state_get SD_CONFIG_ID)")"
+SD_EUREKA_ID="$(sanitize_token "$(state_get SD_EUREKA_ID)")"
+SD_GATEWAY_ID="$(sanitize_token "$(state_get SD_GATEWAY_ID)")"
+SD_PRODUCTS_ID="$(sanitize_token "$(state_get SD_PRODUCTS_ID)")"
+SD_ORDERS_ID="$(sanitize_token "$(state_get SD_ORDERS_ID)")"
+SD_PAY_ID="$(sanitize_token "$(state_get SD_PAY_ID)")"
+SD_USERS_ID="$(sanitize_token "$(state_get SD_USERS_ID)")"
 
 # -------------------------
 # STEP 9) ALB + Target Group + Listener(s)
@@ -777,9 +791,7 @@ if ! is_step_done 9; then
   state_set ALB_DNS "$ALB_DNS"
   ok "ALB DNS: $ALB_DNS"
 
-  # Listeners
   if [[ "$ENABLE_HTTPS" == "true" ]]; then
-    # 443 forward
     L443="$(state_get LISTENER_ARN_443)"; [[ -z "$L443" ]] && L443="$(get_listener_arn "$ALB_ARN" 443)"
     if [[ -z "$L443" ]]; then
       L443="$(awsq elbv2 create-listener --load-balancer-arn "$ALB_ARN" \
@@ -796,7 +808,6 @@ if ! is_step_done 9; then
     fi
     state_set LISTENER_ARN_443 "$L443"
 
-    # 80 redirect -> 443
     L80="$(state_get LISTENER_ARN_80)"; [[ -z "$L80" ]] && L80="$(get_listener_arn "$ALB_ARN" 80)"
     if [[ -z "$L80" ]]; then
       L80="$(awsq elbv2 create-listener --load-balancer-arn "$ALB_ARN" \
@@ -811,7 +822,6 @@ if ! is_step_done 9; then
     fi
     state_set LISTENER_ARN_80 "$L80"
   else
-    # HTTP only: 80 forward
     L80="$(state_get LISTENER_ARN_80)"; [[ -z "$L80" ]] && L80="$(get_listener_arn "$ALB_ARN" 80)"
     if [[ -z "$L80" ]]; then
       L80="$(awsq elbv2 create-listener --load-balancer-arn "$ALB_ARN" \
@@ -850,6 +860,7 @@ if ! is_step_done 10; then
     local cpu="$6"
     local mem="$7"
     local env_json="${8:-[]}"
+    local health_path="${9:-/actuator/health}"
 
     if ! echo "${env_json:-[]}" | jq -e 'type=="array"' >/dev/null 2>&1; then env_json="[]"; fi
     env_json="$(echo "$env_json" | jq -c .)"
@@ -867,6 +878,13 @@ if ! is_step_done 10; then
           \"essential\": true,
           \"portMappings\": [{\"containerPort\": $port, \"protocol\": \"tcp\"}],
           \"environment\": $env_json,
+          \"healthCheck\": {
+            \"command\": [\"CMD-SHELL\", \"curl -f http://localhost:$port$health_path || exit 1\"],
+            \"interval\": 30,
+            \"timeout\": 5,
+            \"retries\": 3,
+            \"startPeriod\": 60
+          },
           \"logConfiguration\": {
             \"logDriver\": \"awslogs\",
             \"options\": {
@@ -879,17 +897,19 @@ if ! is_step_done 10; then
       ]" | jq -r '.taskDefinition.taskDefinitionArn'
   }
 
-ENV_CONFIG="$(jq -nc \
+  ENV_CONFIG="$(jq -nc \
     --arg uri "$CONFIG_GIT_URI" \
     --arg br "$CONFIG_GIT_BRANCH" \
     --arg paths "$CONFIG_GIT_PATHS" \
     '[
       {"name":"SERVER_PORT","value":"8081"},
-      {"name":"HOME","value":"/tmp"},  # <-- NUEVA LÍNEA
+      {"name":"HOME","value":"/tmp"},
       {"name":"SPRING_CLOUD_CONFIG_SERVER_GIT_URI","value":$uri},
       {"name":"SPRING_CLOUD_CONFIG_SERVER_GIT_DEFAULT_LABEL","value":$br},
       {"name":"SPRING_CLOUD_CONFIG_SERVER_GIT_SEARCH_PATHS","value":$paths},
-      {"name":"SPRING_CLOUD_CONFIG_SERVER_GIT_CLONE_ON_START","value":"true"}
+      {"name":"SPRING_CLOUD_CONFIG_SERVER_GIT_CLONE_ON_START","value":"true"},
+      {"name":"SPRING_CLOUD_CONFIG_SERVER_GIT_FORCE_PULL","value":"true"},
+      {"name":"SPRING_CLOUD_CONFIG_SERVER_GIT_BASEDIR","value":"/tmp/config-repo"}
     ]')"
 
   ENV_CLIENT_BASE="$(jq -nc --arg ns "$NAMESPACE_NAME" '[
@@ -899,36 +919,45 @@ ENV_CONFIG="$(jq -nc \
     {"name":"SPRING_CLOUD_CONFIG_RETRY_INITIAL_INTERVAL","value":"2000"},
     {"name":"SPRING_CLOUD_CONFIG_RETRY_MULTIPLIER","value":"1.5"},
     {"name":"SPRING_CLOUD_CONFIG_RETRY_MAX_INTERVAL","value":"10000"},
-    {"name":"EUREKA_CLIENT_SERVICEURL_DEFAULTZONE","value":("http://eurekaservice."+ $ns +":8761/eureka/")}
+    {"name":"EUREKA_CLIENT_SERVICEURL_DEFAULTZONE","value":("http://eurekaservice."+ $ns +":8761/eureka/")},
+    {"name":"EUREKA_CLIENT_REGISTRY_FETCH_INTERVAL_SECONDS","value":"5"},
+    {"name":"EUREKA_INSTANCE_LEASE_RENEWAL_INTERVAL_IN_SECONDS","value":"10"},
+    {"name":"EUREKA_INSTANCE_LEASE_EXPIRATION_DURATION_IN_SECONDS","value":"30"}
   ]')"
 
   ENV_EUREKA="$(jq -nc --arg ns "$NAMESPACE_NAME" '[
-    {"name":"HOME","value":"/tmp"},  # Opcional
-    {"name":"CONFIG_SERVICE_URL","value":("http://configservice."+ $ns +":8081")},
+    {"name":"HOME","value":"/tmp"},
+    {"name":"SERVER_PORT","value":"8761"},
+    {"name":"SPRING_CLOUD_CONFIG_URI","value":("http://configservice."+ $ns +":8081")},
     {"name":"SPRING_CLOUD_CONFIG_FAIL_FAST","value":"false"},
     {"name":"SPRING_CLOUD_CONFIG_RETRY_MAX_ATTEMPTS","value":"20"},
     {"name":"SPRING_CLOUD_CONFIG_RETRY_INITIAL_INTERVAL","value":"2000"},
     {"name":"SPRING_CLOUD_CONFIG_RETRY_MULTIPLIER","value":"1.5"},
     {"name":"SPRING_CLOUD_CONFIG_RETRY_MAX_INTERVAL","value":"10000"},
     {"name":"EUREKA_CLIENT_REGISTER_WITH_EUREKA","value":"false"},
-    {"name":"EUREKA_CLIENT_FETCH_REGISTRY","value":"false"}
+    {"name":"EUREKA_CLIENT_FETCH_REGISTRY","value":"false"},
+    {"name":"EUREKA_INSTANCE_HOSTNAME","value":("eurekaservice."+ $ns)},
+    {"name":"SERVER_WAIT_TIME_IN_MS_WHEN_SYNC_EMPTY","value":"0"}
   ]')"
-  
+
   MYSQL_ENV="[]"
   if [[ -n "${DB_ENDPOINT:-}" ]]; then
-    # Solo si tú decides usar DB_ENDPOINT
-    [[ -n "${DB_PASS:-}" ]] || { echo "❌ DB_ENDPOINT definido pero DB_PASS vacío en .env"; exit 1; }
     MYSQL_ENV="$(jq -nc \
       --arg host "$DB_ENDPOINT" \
       --arg port "$DB_PORT" \
       --arg db "$DB_NAME" \
       --arg user "$DB_USER" \
       --arg pass "$DB_PASS" \
-      '[{"name":"DB_HOST","value":$host},
+      '[
+        {"name":"DB_HOST","value":$host},
         {"name":"DB_PORT","value":$port},
         {"name":"DB_NAME","value":$db},
         {"name":"DB_USER","value":$user},
-        {"name":"DB_PASS","value":$pass}]')"
+        {"name":"DB_PASS","value":$pass},
+        {"name":"SPRING_DATASOURCE_URL","value":("jdbc:mysql://" + $host + ":" + $port + "/" + $db + "?useSSL=false&allowPublicKeyRetrieval=true")},
+        {"name":"SPRING_DATASOURCE_USERNAME","value":$user},
+        {"name":"SPRING_DATASOURCE_PASSWORD","value":$pass}
+      ]')"
   fi
 
   JWT_ENV="$(jq -nc --arg jwt "$JWT_SECRET" '[{"name":"JWT_SECRET","value":$jwt}]')"
@@ -939,13 +968,13 @@ ENV_CONFIG="$(jq -nc \
   ENV_USERS_BASE="$(merge_env "$ENV_CLIENT_BASE" "$MYSQL_ENV")"
   ENV_USERS="$(merge_env "$ENV_USERS_BASE" "$JWT_ENV")"
 
-  TD_CONFIG_ARN="$(register_task_def "${PROJECT}-td-config"     "$ECR/$REPO_CONFIG:$TAG"     "$PORT_CONFIG"   "$LG_CONFIG"   "configservice"   "$CPU_SMALL" "$MEM_SMALL" "$ENV_CONFIG")"
-  TD_EUREKA_ARN="$(register_task_def "${PROJECT}-td-eureka"     "$ECR/$REPO_EUREKA:$TAG"     "$PORT_EUREKA"   "$LG_EUREKA"   "eurekaservice"   "$CPU_SMALL" "$MEM_SMALL" "$ENV_EUREKA")"
-  TD_GATEWAY_ARN="$(register_task_def "${PROJECT}-td-gateway"   "$ECR/$REPO_GATEWAY:$TAG"    "$PORT_GATEWAY"  "$LG_GATEWAY"  "gatewayservice"  "$CPU_MED"   "$MEM_MED"   "$ENV_CLIENT_BASE")"
-  TD_PRODUCTS_ARN="$(register_task_def "${PROJECT}-td-products" "$ECR/$REPO_PRODUCTS:$TAG"   "$PORT_PRODUCTS" "$LG_PRODUCTS" "productservice"  "$CPU_SMALL" "$MEM_SMALL" "$ENV_PRODUCTS")"
-  TD_ORDERS_ARN="$(register_task_def "${PROJECT}-td-orders"     "$ECR/$REPO_ORDERS:$TAG"     "$PORT_ORDERS"   "$LG_ORDERS"   "orderservice"   "$CPU_SMALL" "$MEM_SMALL" "$ENV_ORDERS")"
-  TD_PAY_ARN="$(register_task_def "${PROJECT}-td-pay"           "$ECR/$REPO_PAY:$TAG"        "$PORT_PAY"      "$LG_PAY"      "paymentservice" "$CPU_SMALL" "$MEM_SMALL" "$ENV_PAY")"
-  TD_USERS_ARN="$(register_task_def "${PROJECT}-td-users"       "$ECR/$REPO_USERS:$TAG"      "$PORT_USERS"    "$LG_USERS"    "userservice"    "$CPU_SMALL" "$MEM_SMALL" "$ENV_USERS")"
+  TD_CONFIG_ARN="$(register_task_def "${PROJECT}-td-config"     "$ECR/$REPO_CONFIG:$TAG"     "$PORT_CONFIG"   "$LG_CONFIG"   "configservice"   "$CPU_SMALL" "$MEM_SMALL" "$ENV_CONFIG"    "/actuator/health")"
+  TD_EUREKA_ARN="$(register_task_def "${PROJECT}-td-eureka"     "$ECR/$REPO_EUREKA:$TAG"     "$PORT_EUREKA"   "$LG_EUREKA"   "eurekaservice"   "$CPU_SMALL" "$MEM_SMALL" "$ENV_EUREKA"    "/actuator/health")"
+  TD_GATEWAY_ARN="$(register_task_def "${PROJECT}-td-gateway"   "$ECR/$REPO_GATEWAY:$TAG"   "$PORT_GATEWAY"  "$LG_GATEWAY"  "gatewayservice"  "$CPU_MED"   "$MEM_MED"   "$ENV_CLIENT_BASE" "/actuator/health")"
+  TD_PRODUCTS_ARN="$(register_task_def "${PROJECT}-td-products" "$ECR/$REPO_PRODUCTS:$TAG"  "$PORT_PRODUCTS" "$LG_PRODUCTS" "productservice"  "$CPU_SMALL" "$MEM_SMALL" "$ENV_PRODUCTS"   "/actuator/health")"
+  TD_ORDERS_ARN="$(register_task_def "${PROJECT}-td-orders"     "$ECR/$REPO_ORDERS:$TAG"    "$PORT_ORDERS"   "$LG_ORDERS"   "orderservice"    "$CPU_SMALL" "$MEM_SMALL" "$ENV_ORDERS"     "/actuator/health")"
+  TD_PAY_ARN="$(register_task_def "${PROJECT}-td-pay"           "$ECR/$REPO_PAY:$TAG"       "$PORT_PAY"      "$LG_PAY"      "paymentservice"  "$CPU_SMALL" "$MEM_SMALL" "$ENV_PAY"        "/actuator/health")"
+  TD_USERS_ARN="$(register_task_def "${PROJECT}-td-users"       "$ECR/$REPO_USERS:$TAG"     "$PORT_USERS"    "$LG_USERS"    "userservice"     "$CPU_SMALL" "$MEM_SMALL" "$ENV_USERS"      "/actuator/health")"
 
   state_set TD_CONFIG_ARN "$TD_CONFIG_ARN"
   state_set TD_EUREKA_ARN "$TD_EUREKA_ARN"
@@ -967,7 +996,7 @@ TD_PAY_ARN="$(state_get TD_PAY_ARN)"
 TD_USERS_ARN="$(state_get TD_USERS_ARN)"
 
 # -------------------------
-# STEP 11) ECS Services (create/update) + Gateway attach to ALB
+# STEP 11) ECS Services ✅ FIX: service-registries JSON + VALIDACIONES
 # -------------------------
 service_exists_ecs() {
   awsq ecs describe-services --cluster "$CLUSTER_NAME" --services "$1" \
@@ -975,36 +1004,76 @@ service_exists_ecs() {
 }
 
 create_or_update_service_sd() {
-  local svc="$1"; local td="$2"; local net="$3"; local sd_service_id="$4"
+  local svc="$1"
+  local td="$2"
+  local net="$3"
+  local sd_service_id="$4"
+
+  sd_service_id="$(sanitize_token "$sd_service_id")"
+  require_nonempty "CloudMap ServiceId ($svc)" "$sd_service_id"
+
+  local sd_arn="arn:aws:servicediscovery:${REGION}:${ACCOUNT_ID}:service/${sd_service_id}"
+
   if service_exists_ecs "$svc"; then
     log "ECS service existe, actualizando: $svc"
-    awsq ecs update-service --cluster "$CLUSTER_NAME" --service "$svc" \
-      --task-definition "$td" --desired-count 1 --force-new-deployment >/dev/null
+    awsq ecs update-service \
+      --cluster "$CLUSTER_NAME" \
+      --service "$svc" \
+      --task-definition "$td" \
+      --desired-count 1 \
+      --force-new-deployment >/dev/null
     return 0
   fi
-  awsq ecs create-service --cluster "$CLUSTER_NAME" --service-name "$svc" \
-    --task-definition "$td" --desired-count 1 --launch-type FARGATE \
+
+  log "Creando servicio ECS: $svc con CloudMap: $sd_arn"
+
+  awsq ecs create-service \
+    --cluster "$CLUSTER_NAME" \
+    --service-name "$svc" \
+    --task-definition "$td" \
+    --desired-count 1 \
+    --launch-type FARGATE \
     --network-configuration "$net" \
-    --service-registries "registryArn=arn:aws:servicediscovery:${REGION}:${ACCOUNT_ID}:service/${sd_service_id}" \
+    --service-registries "[{\"registryArn\":\"${sd_arn}\"}]" \
     --health-check-grace-period-seconds 120 >/dev/null
 }
 
 create_or_update_service_sd_lb() {
-  local svc="$1"; local td="$2"; local net="$3"; local sd_service_id="$4"
-  local tg="$5"; local cname="$6"; local cport="$7"
+  local svc="$1"
+  local td="$2"
+  local net="$3"
+  local sd_service_id="$4"
+  local tg="$5"
+  local cname="$6"
+  local cport="$7"
+
+  sd_service_id="$(sanitize_token "$sd_service_id")"
+  require_nonempty "CloudMap ServiceId ($svc)" "$sd_service_id"
+
+  local sd_arn="arn:aws:servicediscovery:${REGION}:${ACCOUNT_ID}:service/${sd_service_id}"
 
   if service_exists_ecs "$svc"; then
     log "ECS service existe, actualizando: $svc"
-    awsq ecs update-service --cluster "$CLUSTER_NAME" --service "$svc" \
-      --task-definition "$td" --desired-count 1 --force-new-deployment >/dev/null
+    awsq ecs update-service \
+      --cluster "$CLUSTER_NAME" \
+      --service "$svc" \
+      --task-definition "$td" \
+      --desired-count 1 \
+      --force-new-deployment >/dev/null
     return 0
   fi
 
-  awsq ecs create-service --cluster "$CLUSTER_NAME" --service-name "$svc" \
-    --task-definition "$td" --desired-count 1 --launch-type FARGATE \
+  log "Creando servicio ECS: $svc con CloudMap: $sd_arn y ALB"
+
+  awsq ecs create-service \
+    --cluster "$CLUSTER_NAME" \
+    --service-name "$svc" \
+    --task-definition "$td" \
+    --desired-count 1 \
+    --launch-type FARGATE \
     --network-configuration "$net" \
-    --service-registries "registryArn=arn:aws:servicediscovery:${REGION}:${ACCOUNT_ID}:service/${sd_service_id}" \
-    --load-balancers "targetGroupArn=$tg,containerName=$cname,containerPort=$cport" \
+    --service-registries "[{\"registryArn\":\"${sd_arn}\"}]" \
+    --load-balancers "targetGroupArn=${tg},containerName=${cname},containerPort=${cport}" \
     --health-check-grace-period-seconds 180 >/dev/null
 }
 
@@ -1021,6 +1090,33 @@ if ! is_step_done 11; then
   NETCONF_CONFIG="awsvpcConfiguration={subnets=[$PUB1_ID,$PUB2_ID],securityGroups=[$SG_CONFIG_ID],assignPublicIp=ENABLED}"
   NETCONF_PRIVATE="awsvpcConfiguration={subnets=[$PRI1_ID,$PRI2_ID],securityGroups=[$SG_ECS_PRIVATE_ID],assignPublicIp=DISABLED}"
 
+  # ✅ SIEMPRE leer IDs desde state (no confíes en variables viejas en memoria)
+  SD_CONFIG_ID="$(sanitize_token "$(state_get SD_CONFIG_ID)")"
+  SD_EUREKA_ID="$(sanitize_token "$(state_get SD_EUREKA_ID)")"
+  SD_GATEWAY_ID="$(sanitize_token "$(state_get SD_GATEWAY_ID)")"
+  SD_PRODUCTS_ID="$(sanitize_token "$(state_get SD_PRODUCTS_ID)")"
+  SD_ORDERS_ID="$(sanitize_token "$(state_get SD_ORDERS_ID)")"
+  SD_PAY_ID="$(sanitize_token "$(state_get SD_PAY_ID)")"
+  SD_USERS_ID="$(sanitize_token "$(state_get SD_USERS_ID)")"
+
+  # ✅ Validar antes de crear ECS services (evita ...:service/)
+  require_nonempty "SD_CONFIG_ID" "$SD_CONFIG_ID"
+  require_nonempty "SD_EUREKA_ID" "$SD_EUREKA_ID"
+  require_nonempty "SD_GATEWAY_ID" "$SD_GATEWAY_ID"
+  require_nonempty "SD_PRODUCTS_ID" "$SD_PRODUCTS_ID"
+  require_nonempty "SD_ORDERS_ID" "$SD_ORDERS_ID"
+  require_nonempty "SD_PAY_ID" "$SD_PAY_ID"
+  require_nonempty "SD_USERS_ID" "$SD_USERS_ID"
+
+  log "Verificando IDs de Cloud Map:"
+  log "  SD_CONFIG_ID=${SD_CONFIG_ID}"
+  log "  SD_EUREKA_ID=${SD_EUREKA_ID}"
+  log "  SD_GATEWAY_ID=${SD_GATEWAY_ID}"
+  log "  SD_PRODUCTS_ID=${SD_PRODUCTS_ID}"
+  log "  SD_ORDERS_ID=${SD_ORDERS_ID}"
+  log "  SD_PAY_ID=${SD_PAY_ID}"
+  log "  SD_USERS_ID=${SD_USERS_ID}"
+
   create_or_update_service_sd    "$SVC_CONFIG"    "$TD_CONFIG_ARN"    "$NETCONF_CONFIG"   "$SD_CONFIG_ID"
   create_or_update_service_sd    "$SVC_EUREKA"    "$TD_EUREKA_ARN"    "$NETCONF_PRIVATE"  "$SD_EUREKA_ID"
   create_or_update_service_sd_lb "$SVC_GATEWAY"   "$TD_GATEWAY_ARN"   "$NETCONF_PRIVATE"  "$SD_GATEWAY_ID" \
@@ -1032,7 +1128,6 @@ if ! is_step_done 11; then
 
   step_done 11
 fi
-
 echo ""
 ok "Deploy completado (resumible/idempotente)."
 if [[ "$ENABLE_HTTPS" == "true" ]]; then
