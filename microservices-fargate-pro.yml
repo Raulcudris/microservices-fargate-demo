@@ -255,7 +255,7 @@ Resources:
   AlbSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Allow HTTP from Internet to ALB
+      GroupDescription: ALB inbound
       VpcId: !Ref VPC
       SecurityGroupIngress:
         - IpProtocol: tcp
@@ -266,59 +266,13 @@ Resources:
   ServiceSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: ECS services SG (ALB->Gateway and internal)
+      GroupDescription: ECS inbound from ALB only
       VpcId: !Ref VPC
-
-  # ALB -> Gateway:8080
-  IngressAlbToGateway:
-    Type: AWS::EC2::SecurityGroupIngress
-    Properties:
-      GroupId: !Ref ServiceSecurityGroup
-      IpProtocol: tcp
-      FromPort: 8080
-      ToPort: 8080
-      SourceSecurityGroupId: !Ref AlbSecurityGroup
-
-  # Internal service-to-service (self-referencing)
-  IngressInternalConfig:
-    Type: AWS::EC2::SecurityGroupIngress
-    Properties:
-      GroupId: !Ref ServiceSecurityGroup
-      IpProtocol: tcp
-      FromPort: 8081
-      ToPort: 8081
-      SourceSecurityGroupId: !Ref ServiceSecurityGroup
-
-  IngressInternalEureka:
-    Type: AWS::EC2::SecurityGroupIngress
-    Properties:
-      GroupId: !Ref ServiceSecurityGroup
-      IpProtocol: tcp
-      FromPort: 8761
-      ToPort: 8761
-      SourceSecurityGroupId: !Ref ServiceSecurityGroup
-
-  IngressInternalServices:
-    Type: AWS::EC2::SecurityGroupIngress
-    Properties:
-      GroupId: !Ref ServiceSecurityGroup
-      IpProtocol: tcp
-      FromPort: 8001
-      ToPort: 8004
-      SourceSecurityGroupId: !Ref ServiceSecurityGroup
-
-  # Optional: authorize RDS SG inbound 3306 from ECS SG
-  RdsIngressFromEcs:
-    Type: AWS::EC2::SecurityGroupIngress
-    Condition: HasRdsSg
-    Properties:
-      GroupId: !Ref RdsSecurityGroupId
-      IpProtocol: tcp
-      FromPort: 3306
-      ToPort: 3306
-      SourceSecurityGroupId: !Ref ServiceSecurityGroup
-
-  # -------------------------
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref AlbSecurityGroup  # -------------------------
   # Cloud Map (Service Discovery)
   # -------------------------
   PrivateNamespace:
@@ -505,7 +459,6 @@ Resources:
   ALB:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Properties:
-      Name: !Sub "${ProjectName}-alb"
       Scheme: internet-facing
       Type: application
       Subnets:
@@ -517,7 +470,6 @@ Resources:
   TargetGroupGateway:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
-      Name: !Sub "${ProjectName}-tg-gw"
       VpcId: !Ref VPC
       TargetType: ip
       Port: 8080
