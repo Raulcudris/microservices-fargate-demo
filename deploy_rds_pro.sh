@@ -62,7 +62,7 @@ if [[ -z "$EXISTS" ]]; then
     --db-name "$DB_NAME" \
     --vpc-security-group-ids "$DB_SG_ID" \
     --db-subnet-group-name "$DB_SUBNET_GROUP" \
-    --backup-retention-period 7 \
+    --backup-retention-period 0 \
     --no-publicly-accessible \
     --port "$DB_PORT" >/dev/null
 fi

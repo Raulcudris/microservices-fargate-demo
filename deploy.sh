@@ -475,35 +475,82 @@ wait_cloudmap_success(){
   die "Timeout CloudMap op: $op"
 }
 
-ensure_sd_service(){
+ensure_sd_service() {
   local svc_name="$1"
   local ns_id="$2"
   local key="$3"
 
+  # 1) si ya está en state, úsalo
   local existing
   existing="$(sanitize_token "$(state_get "$key")")"
-
-  if [[ -z "$existing" || "$existing" == "null" ]]; then
-    local all
-    all="$(awsq servicediscovery list-services --output json 2>/dev/null || echo '{"Services":[]}')"
-    existing="$(echo "$all" | jq -r --arg name "$svc_name" --arg ns "$ns_id" '.Services[] | select(.Name==$name and .NamespaceId==$ns) | .Id' | head -1)"
-    existing="$(sanitize_token "$existing")"
+  if [[ -n "$existing" && "$existing" != "null" && "$existing" != "None" ]]; then
+    echo "$existing"
+    return 0
   fi
 
-  if [[ -n "$existing" && "$existing" != "null" ]]; then
+  # 2) buscar por paginación en list-services
+  find_sd_service_id() {
+    local token=""
+    while :; do
+      local resp
+      if [[ -n "$token" && "$token" != "null" && "$token" != "None" ]]; then
+        resp="$(awsq servicediscovery list-services --next-token "$token" --output json)"
+      else
+        resp="$(awsq servicediscovery list-services --output json)"
+      fi
+
+      local id
+      id="$(echo "$resp" | jq -r --arg name "$svc_name" --arg ns "$ns_id" \
+        '.Services[] | select(.Name==$name and .NamespaceId==$ns) | .Id' | head -n 1)"
+      id="$(sanitize_token "$id")"
+      if [[ -n "$id" && "$id" != "null" && "$id" != "None" ]]; then
+        echo "$id"
+        return 0
+      fi
+
+      token="$(echo "$resp" | jq -r '.NextToken // empty')"
+      token="$(sanitize_token "$token")"
+      [[ -z "$token" || "$token" == "null" || "$token" == "None" ]] && break
+    done
+    echo ""
+    return 0
+  }
+
+  existing="$(find_sd_service_id)"
+  if [[ -n "$existing" && "$existing" != "null" && "$existing" != "None" ]]; then
     state_set "$key" "$existing"
     echo "$existing"
     return 0
   fi
 
-  local id
-  id="$(awsq servicediscovery create-service --name "$svc_name" \
+  # 3) crear (si al crear dice AlreadyExists, reintenta búsqueda y úsalo)
+  log "CloudMap: creando service '$svc_name' en namespace '$ns_id'..."
+  local out err rc
+  err="$(mktemp)"
+  out="$(mktemp)"
+  set +e
+  awsq servicediscovery create-service --name "$svc_name" \
     --dns-config "NamespaceId=${ns_id},DnsRecords=[{Type=A,TTL=30}],RoutingPolicy=WEIGHTED" \
     --health-check-custom-config FailureThreshold=1 \
-    --query 'Service.Id' --output text 2>/dev/null || true)"
-  id="$(sanitize_token "$id")"
+    --query 'Service.Id' --output text 1>"$out" 2>"$err"
+  rc=$?
+  set -e
 
-  [[ -n "$id" && "$id" != "null" ]] || die "No pude crear CloudMap service: $svc_name"
+  if [[ $rc -ne 0 ]]; then
+    if grep -q "ServiceAlreadyExists" "$err"; then
+      existing="$(find_sd_service_id)"
+      [[ -n "$existing" && "$existing" != "null" && "$existing" != "None" ]] || die "ServiceAlreadyExists pero no pude resolver el Id para: $svc_name"
+      state_set "$key" "$existing"
+      echo "$existing"
+      return 0
+    fi
+    cat "$err" >&2
+    die "No pude crear CloudMap service: $svc_name"
+  fi
+
+  local id
+  id="$(sanitize_token "$(cat "$out")")"
+  [[ -n "$id" && "$id" != "null" && "$id" != "None" ]] || die "No pude crear CloudMap service: $svc_name"
   state_set "$key" "$id"
   echo "$id"
 }
@@ -511,24 +558,34 @@ ensure_sd_service(){
 if ! is_step_done 7; then
   log "7) Cloud Map Namespace + Services..."
   VPC_ID="$(state_get VPC_ID)"
-  NS_ID="$(state_get NS_ID)"; [[ -z "$NS_ID" ]] && NS_ID="$(get_namespace_id_by_name)"
 
-  if [[ -z "$NS_ID" ]]; then
-    OP_ID="$(awsq servicediscovery create-private-dns-namespace --name "$NAMESPACE_NAME" --vpc "$VPC_ID" --description "${PROJECT} private namespace" --query "OperationId" --output text)"
-    wait_cloudmap_success "$OP_ID"
-    NS_ID="$(get_namespace_id_by_name)"
-    [[ -n "$NS_ID" ]] || die "No pude resolver NamespaceId"
+  NS_ID="$(sanitize_token "$(state_get NS_ID)")"
+  if [[ -z "$NS_ID" || "$NS_ID" == "null" || "$NS_ID" == "None" ]]; then
+    NS_ID="$(sanitize_token "$(get_namespace_id_by_name)")"
   fi
+
+  if [[ -z "$NS_ID" || "$NS_ID" == "null" || "$NS_ID" == "None" ]]; then
+    OP_ID="$(awsq servicediscovery create-private-dns-namespace \
+      --name "$NAMESPACE_NAME" \
+      --vpc "$VPC_ID" \
+      --description "${PROJECT} private namespace" \
+      --query "OperationId" --output text)"
+    wait_cloudmap_success "$OP_ID"
+
+    NS_ID="$(sanitize_token "$(get_namespace_id_by_name)")"
+    [[ -n "$NS_ID" && "$NS_ID" != "null" && "$NS_ID" != "None" ]] || die "No pude resolver NamespaceId"
+  fi
+
   state_set NS_ID "$NS_ID"
   ok "Namespace: $NS_ID"
 
-  state_set SD_CONFIG_ID   "$(ensure_sd_service "$SVC_CONFIG"   "$NS_ID" SD_CONFIG_ID)"
-  state_set SD_EUREKA_ID   "$(ensure_sd_service "$SVC_EUREKA"   "$NS_ID" SD_EUREKA_ID)"
-  state_set SD_GATEWAY_ID  "$(ensure_sd_service "$SVC_GATEWAY"  "$NS_ID" SD_GATEWAY_ID)"
-  state_set SD_PRODUCTS_ID "$(ensure_sd_service "$SVC_PRODUCTS" "$NS_ID" SD_PRODUCTS_ID)"
-  state_set SD_ORDERS_ID   "$(ensure_sd_service "$SVC_ORDERS"   "$NS_ID" SD_ORDERS_ID)"
-  state_set SD_PAY_ID      "$(ensure_sd_service "$SVC_PAY"      "$NS_ID" SD_PAY_ID)"
-  state_set SD_USERS_ID    "$(ensure_sd_service "$SVC_USERS"    "$NS_ID" SD_USERS_ID)"
+  SD_CONFIG_ID="$(ensure_sd_service "$SVC_CONFIG"   "$NS_ID" SD_CONFIG_ID)";   state_set SD_CONFIG_ID   "$SD_CONFIG_ID"
+  SD_EUREKA_ID="$(ensure_sd_service "$SVC_EUREKA"   "$NS_ID" SD_EUREKA_ID)";   state_set SD_EUREKA_ID   "$SD_EUREKA_ID"
+  SD_GATEWAY_ID="$(ensure_sd_service "$SVC_GATEWAY" "$NS_ID" SD_GATEWAY_ID)";  state_set SD_GATEWAY_ID  "$SD_GATEWAY_ID"
+  SD_PRODUCTS_ID="$(ensure_sd_service "$SVC_PRODUCTS" "$NS_ID" SD_PRODUCTS_ID)"; state_set SD_PRODUCTS_ID "$SD_PRODUCTS_ID"
+  SD_ORDERS_ID="$(ensure_sd_service "$SVC_ORDERS"   "$NS_ID" SD_ORDERS_ID)";   state_set SD_ORDERS_ID   "$SD_ORDERS_ID"
+  SD_PAY_ID="$(ensure_sd_service "$SVC_PAY"         "$NS_ID" SD_PAY_ID)";      state_set SD_PAY_ID      "$SD_PAY_ID"
+  SD_USERS_ID="$(ensure_sd_service "$SVC_USERS"     "$NS_ID" SD_USERS_ID)";    state_set SD_USERS_ID    "$SD_USERS_ID"
 
   step_done 7
 fi
